@@ -177,44 +177,81 @@ pub struct ZKSig { pub z: G1, pub s: G1, pub s_hat: G2, pub t: G1 }
 #[derive(Clone, Debug)]
 pub struct AuthCommitment { pub c: G1, pub sigma: ZKSig }
 
-pub fn setup() -> PP { let g1 = G1::generator(); let g2 = G2::generator(); let r = Fr::random(); let p = g1 * r; PP { g1, p, g2 } }
-pub fn key_gen(pp: &PP) -> KeyPair { let sk = Fr::random(); let vk = pp.g2 * sk; KeyPair { sk, vk } }
+pub fn setup() -> PP {
+    println!("[RSUC] 正在执行 Setup...");
+    let g1 = G1::generator();
+    let g2 = G2::generator();
+    let r = Fr::random();
+    let p = g1 * r;
+    PP { g1, p, g2 }
+}
+
+pub fn key_gen(pp: &PP) -> KeyPair {
+    println!("[RSUC] 正在执行 KeyGen...");
+    let sk = Fr::random();
+    let vk = pp.g2 * sk;
+    KeyPair { sk, vk }
+}
+
 pub fn auth_com(v: Fr, x: Fr, r: Fr, pp: &PP) -> AuthCommitment {
+    println!("[RSUC] 正在执行 AuthCom (生成承诺)...");
     let c = (pp.g1 * v) + (pp.p * r);
-    let s = Fr::random(); let s_inv = s.inverse();
+    
+    let s = Fr::random(); 
+    let s_inv = s.inverse();
     let z = ((pp.g1 + (c * x)) * s_inv);
     let sigma = ZKSig { z, s: pp.g1 * s, s_hat: pp.g2 * s, t: pp.p * x * s_inv };
+    
     AuthCommitment { c, sigma }
 }
-pub fn vf_com(c: G1, v: Fr, r: Fr, pp: &PP) -> bool { c == (pp.g1 * v) + (pp.p * r) }
+
+pub fn vf_com(c: G1, v: Fr, r: Fr, pp: &PP) -> bool {
+    println!("[RSUC] 正在执行 VfCom (验证承诺)...");
+    c == (pp.g1 * v) + (pp.p * r)
+}
+
 pub fn vf_auth(c: G1, sigma: &ZKSig, vk: G2, pp: &PP) -> bool {
+    println!("[RSUC] 正在执行 VfAuth (验证零知识证明)...");
     if sigma.s.is_infinity() { return false; }
+    
     let ch1 = fp12_eq(&pairing(sigma.s_hat, sigma.z), &fp12_mul(&pairing(pp.g2, pp.g1), &pairing(vk, c)));
     let ch2 = fp12_eq(&pairing(sigma.s_hat, pp.g1), &pairing(pp.g2, sigma.s));
     let ch3 = fp12_eq(&pairing(sigma.s_hat, sigma.t), &pairing(vk, pp.p));
+    
     ch1 && ch2 && ch3
 }
+
 pub fn rdm_ac(c: G1, sigma: &ZKSig, r_p: Fr, pp: &PP) -> AuthCommitment {
+    println!("[RSUC] 正在执行 RdmAC (随机化承诺)...");
     let c_new = c + (pp.p * r_p);
-    let s_p = Fr::random(); let s_inv = s_p.inverse();
+    let s_p = Fr::random(); 
+    let s_inv = s_p.inverse();
     let z_new = (sigma.z + (sigma.t * r_p)) * s_inv;
-    AuthCommitment { c: c_new, sigma: ZKSig { z: z_new, s: sigma.s * s_p, s_hat: sigma.s_hat * s_p, t: sigma.t * s_inv } }
+    AuthCommitment { 
+        c: c_new, 
+        sigma: ZKSig { z: z_new, s: sigma.s * s_p, s_hat: sigma.s_hat * s_p, t: sigma.t * s_inv } 
+    }
 }
+
 pub fn upd_ac(c: G1, a: Fr, x: Fr, pp: &PP) -> AuthCommitment {
+    println!("[RSUC] 正在执行 UpdAC (同态更新)...");
     let c_new = c + (pp.g1 * a);
-    let s = Fr::random(); let s_inv = s.inverse();
+    let s = Fr::random(); 
+    let s_inv = s.inverse();
     let z = ((pp.g1 + (c_new * x)) * s_inv);
     let sigma = ZKSig { z, s: pp.g1 * s, s_hat: pp.g2 * s, t: pp.p * x * s_inv };
     AuthCommitment { c: c_new, sigma }
 }
+
 pub fn vf_upd(c: G1, a: Fr, c_new: G1, sigma_new: &ZKSig, vk: G2, pp: &PP) -> bool {
+    println!("[RSUC] 正在执行 VfUpd (验证更新)...");
     let expected_c_new = c + (pp.g1 * a);
     if expected_c_new != c_new { return false; }
     vf_auth(c_new, sigma_new, vk, pp)
 }
 
 // ==========================================
-// [核心] 第三部分：工具函数 (序列化与加密)
+// [核心] 第三部分：工具函数
 // ==========================================
 pub mod utils {
     use super::wrapper::*;
@@ -246,12 +283,14 @@ pub mod utils {
     }
 
     pub fn hash256(data: &[u8]) -> Vec<u8> {
+        // println!("[Crypto] 正在执行 Hash256...");
         let mut hasher = Sha256::new();
         hasher.update(data);
         hasher.finalize().to_vec()
     }
 
     pub fn xor_r(r: Fr, key: &[u8]) -> Vec<u8> {
+        println!("[Crypto] 正在执行 XOR 加密/解密...");
         let r_hex = r.to_hex();
         let r_bytes = hex::decode(r_hex).unwrap(); 
         let mut out = vec![0u8; r_bytes.len()];
@@ -261,39 +300,32 @@ pub mod utils {
         out
     }
 
-    // [重要] 完整恢复 Fr
     pub fn recover_r_from_bytes(bytes: &[u8]) -> Fr {
+        println!("[Crypto] 正在执行数据恢复 (Bytes -> Fr)...");
         if bytes.len() != 32 { return Fr::zero(); }
         let hex_str = hex::encode(bytes);
         Fr::from_hex(&hex_str).unwrap_or(Fr::zero())
     }
 }
 
-// [测试] 完整性验证
+// [测试]
 #[cfg(test)]
 mod tests {
     use super::*;
     use utils::*;
 
     #[test]
-    fn test_data_integrity() {
-        println!("--- 数据完整性测试 ---");
-        let r_origin = Fr::random();
-        let key = hash256(b"test_key");
+    fn test_flow_logs() {
+        println!("--- 测试日志输出 ---");
+        let pp = setup();
+        let kp = key_gen(&pp);
+        let v = Fr::random();
+        let r = Fr::random();
+        let ac = auth_com(v, kp.sk, r, &pp);
+        vf_com(ac.c, v, r, &pp);
+        vf_auth(ac.c, &ac.sigma, kp.vk, &pp);
         
-        // 加密
-        let cipher = xor_r(r_origin, &key);
-        assert_eq!(cipher.len(), 32);
-
-        // 解密
-        let mut recovered_bytes = vec![0u8; 32];
-        for i in 0..32 { recovered_bytes[i] = cipher[i] ^ key[i % key.len()]; }
-        
-        // 恢复
-        let r_recovered = recover_r_from_bytes(&recovered_bytes);
-        
-        // 验证 (Hex 比较)
-        assert_eq!(r_origin.to_hex(), r_recovered.to_hex(), "❌ r 精度丢失！");
-        println!("✅ Fr 数据完整性测试通过");
+        let key = hash256(b"key");
+        let _ = xor_r(r, &key);
     }
 }

@@ -6,7 +6,11 @@ mod crypto;
 mod wallet;
 
 use clap::Parser;
-use std::error::Error;
+use std::{collections::btree_map::Range, error::Error};
+
+
+
+use bls_bulletproofs::RangeProof;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -22,6 +26,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    
     let config = config::load()?;
     let args = Args::parse();
     

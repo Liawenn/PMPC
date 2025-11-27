@@ -29,6 +29,29 @@ pub struct ContractsConfig {
     pub payment_channel: Address,
 }
 
+impl AppConfig {
+    // [新增] 根据用户名查找 P2P 监听端口
+    pub fn get_user_port(&self, name: &str) -> Option<u16> {
+        for user in &self.users {
+            if user.name == name {
+                return user.port;
+            }
+        }
+        None
+    }
+    
+    // [新增] 根据用户名查找 Host (通常是 127.0.0.1)
+    pub fn get_user_host(&self, name: &str) -> Option<String> {
+        for user in &self.users {
+            if user.name == name {
+                // 如果 config 里没写 host，默认 localhost
+                return Some(user.host.clone().unwrap_or("127.0.0.1".to_string()));
+            }
+        }
+        None
+    }
+}
+
 pub fn load() -> Result<AppConfig, Box<dyn Error>> {
     let content = fs::read_to_string("config.toml")
         .map_err(|_| "❌ 找不到 config.toml，请确保它在项目根目录！")?;
