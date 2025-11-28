@@ -7,6 +7,8 @@ pub struct Message {
     
     #[serde(default)] pub channel_id: Option<String>,
     #[serde(default)] pub request_id: Option<String>,
+    
+    // Join & Common
     #[serde(default)] pub amount: Option<String>,
     #[serde(default)] pub vk: Option<String>,
     #[serde(default)] pub commitment: Option<String>,
@@ -14,15 +16,17 @@ pub struct Message {
     #[serde(default)] pub cipher_r: Option<String>,
     #[serde(default)] pub content: Option<String>,
 
-    // === 交易/P2P 相关 ===
-    #[serde(default)] pub tx_data: Option<String>,   
-    #[serde(default)] pub schnorr_sig: Option<String>, 
-    
-    // === Update 结果 ===
+    // Update
+    #[serde(default)] pub tx_data: Option<String>,
+    #[serde(default)] pub schnorr_sig: Option<String>,
     #[serde(default)] pub sender_commitment: Option<String>,
     #[serde(default)] pub sender_zk_sig: Option<String>,
     #[serde(default)] pub receiver_commitment: Option<String>,
     #[serde(default)] pub receiver_zk_sig: Option<String>,
+
+    // Epoch 相关
+    #[serde(default)] pub epoch_updates: Option<Vec<EpochUpdateItem>>,
+    #[serde(default)] pub epoch_round: Option<u64>,
 }
 
 impl Message {
@@ -36,11 +40,11 @@ impl Message {
             tx_data: None, schnorr_sig: None,
             sender_commitment: None, sender_zk_sig: None,
             receiver_commitment: None, receiver_zk_sig: None,
+            epoch_updates: None, epoch_round: None,
         }
     }
 }
 
-// 交易结构体
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TransactionTx {
     pub sender_commitment: String,
@@ -51,4 +55,12 @@ pub struct TransactionTx {
     pub range_proof: String,
     pub range_com: String, 
     pub timestamp: u64,
+}
+
+// [修复] 补全字段
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EpochUpdateItem {
+    pub commitment: String, 
+    pub signature: String,  
+    pub amount_hex: String, // [新增] 修复报错
 }

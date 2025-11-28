@@ -1,5 +1,5 @@
 use rand::{Rng, RngCore};
-use std::ops::{Add, Mul};
+use std::ops::{Add, Mul, Sub}; // [新增] Sub
 use std::fmt;
 
 // ==========================================
@@ -82,19 +82,16 @@ pub mod wrapper {
 
     impl G1 {
         pub fn generator() -> Self { unsafe { G1(*blst_p1_generator()) } }
-        
         pub fn is_infinity(&self) -> bool {
             let mut p_aff = unsafe { blst_p1_affine::default() };
             unsafe { blst_p1_to_affine(&mut p_aff, &self.0) };
             unsafe { blst_p1_affine_is_inf(&p_aff) }
         }
-
         pub fn to_hex(&self) -> String {
             let mut bytes = [0u8; 48];
             unsafe { blst_p1_compress(bytes.as_mut_ptr(), &self.0) };
             hex::encode(bytes)
         }
-
         pub fn from_hex(s: &str) -> Result<Self, String> {
             let bytes = hex::decode(s).map_err(|e| e.to_string())?;
             if bytes.len() != 48 { return Err("Invalid G1 hex length".into()); }
@@ -119,13 +116,11 @@ pub mod wrapper {
 
     impl G2 {
         pub fn generator() -> Self { unsafe { G2(*blst_p2_generator()) } }
-
         pub fn to_hex(&self) -> String {
             let mut bytes = [0u8; 96];
             unsafe { blst_p2_compress(bytes.as_mut_ptr(), &self.0) };
             hex::encode(bytes)
         }
-
         pub fn from_hex(s: &str) -> Result<Self, String> {
             let bytes = hex::decode(s).map_err(|e| e.to_string())?;
             if bytes.len() != 96 { return Err("Invalid G2 hex length".into()); }
@@ -138,13 +133,35 @@ pub mod wrapper {
         }
     }
 
-    // --- 运算符重载 ---
+    // --- 运算符重载 (Add, Sub, Mul) ---
     impl Add for Fr { type Output = Fr; fn add(self, rhs: Self) -> Self::Output { let mut ret = unsafe { blst_fr::default() }; unsafe { blst_fr_add(&mut ret, &self.0, &rhs.0) }; Fr(ret) } }
     impl Mul for Fr { type Output = Fr; fn mul(self, rhs: Self) -> Self::Output { let mut ret = unsafe { blst_fr::default() }; unsafe { blst_fr_mul(&mut ret, &self.0, &rhs.0) }; Fr(ret) } }
+    // [新增] Fr 减法
+    impl Sub for Fr { 
+        type Output = Fr; 
+        fn sub(self, rhs: Self) -> Self::Output { 
+            let mut ret = unsafe { blst_fr::default() }; 
+            unsafe { blst_fr_sub(&mut ret, &self.0, &rhs.0) }; 
+            Fr(ret) 
+        } 
+    }
+
     impl Add for G1 { type Output = G1; fn add(self, rhs: Self) -> Self::Output { let mut ret = unsafe { blst_p1::default() }; unsafe { blst_p1_add(&mut ret, &self.0, &rhs.0) }; G1(ret) } }
+    // [新增] G1 减法
+    impl Sub for G1 {
+        type Output = G1;
+        fn sub(self, rhs: Self) -> Self::Output {
+            let mut rhs_neg = rhs.0;
+            unsafe { blst_p1_cneg(&mut rhs_neg, true) }; // 取反
+            let mut ret = unsafe { blst_p1::default() };
+            unsafe { blst_p1_add(&mut ret, &self.0, &rhs_neg) };
+            G1(ret)
+        }
+    }
     impl Mul<Fr> for G1 { type Output = G1; fn mul(self, rhs: Fr) -> Self::Output { let mut ret = unsafe { blst_p1::default() }; let mut scalar = unsafe { blst_scalar::default() }; unsafe { blst_scalar_from_fr(&mut scalar, &rhs.0) }; unsafe { blst_p1_mult(&mut ret, &self.0, scalar.b.as_ptr(), 255) }; G1(ret) } }
-    impl Mul<Fr> for G2 { type Output = G2; fn mul(self, rhs: Fr) -> Self::Output { let mut ret = unsafe { blst_p2::default() }; let mut scalar = unsafe { blst_scalar::default() }; unsafe { blst_scalar_from_fr(&mut scalar, &rhs.0) }; unsafe { blst_p2_mult(&mut ret, &self.0, scalar.b.as_ptr(), 255) }; G2(ret) } }
     impl PartialEq for G1 { fn eq(&self, other: &Self) -> bool { unsafe { blst_p1_is_equal(&self.0, &other.0) } } }
+
+    impl Mul<Fr> for G2 { type Output = G2; fn mul(self, rhs: Fr) -> Self::Output { let mut ret = unsafe { blst_p2::default() }; let mut scalar = unsafe { blst_scalar::default() }; unsafe { blst_scalar_from_fr(&mut scalar, &rhs.0) }; unsafe { blst_p2_mult(&mut ret, &self.0, scalar.b.as_ptr(), 255) }; G2(ret) } }
 
     // --- 配对函数 ---
     pub fn pairing(p2: G2, p1: G1) -> blst_fp12 {
@@ -251,6 +268,88 @@ pub fn vf_upd(c: G1, a: Fr, c_new: G1, sigma_new: &ZKSig, vk: G2, pp: &PP) -> bo
 }
 
 // ==========================================
+// [新增功能] 去随机化 & 批量更新
+// ==========================================
+
+// 1. 去随机化 (De-randomization)
+// 公式: C = C_new - r'*P
+//       Z = Z_new - r'*T_new
+//       Other parts remain same
+pub fn unrandomize(c_new: G1, sigma_new: &ZKSig, r_prime: Fr, pp: &PP) -> AuthCommitment {
+    println!("[RSUC] 正在执行 Unrandomize (去随机化)...");
+    
+    // 恢复原始承诺: C = C_rand - r' * P
+    let c = c_new - (pp.p * r_prime);
+
+    // 恢复 Z: Z = Z_rand - r' * T
+    let z = sigma_new.z - (sigma_new.t * r_prime);
+
+    // 构造去随机化后的 Sigma (S, S_hat, T 保持不变)
+    let sigma = ZKSig {
+        z,
+        s: sigma_new.s,
+        s_hat: sigma_new.s_hat,
+        t: sigma_new.t,
+    };
+
+    AuthCommitment { c, sigma }
+}
+
+// 2. 批量更新 (Batch Update / Epoch Aggregation)
+// 公式: C* = Sum(C^i) - (k-1)*C_base  (假设输入 updates 包含 k 个累积状态)
+// 这里我们假设输入是: 基础状态 base_ac, 以及本 Epoch 收到的所有 updates (每个都是相对于 base 的最终状态)
+// 输出: 聚合后的新状态 (带有 Fresh Signature)
+pub fn batch_verify_update(base_c: G1, updates: Vec<G1>, sk: Fr, pp: &PP) -> AuthCommitment {
+    println!("[RSUC] 正在执行 Batch Update (聚合更新)...");
+    
+    let k = updates.len();
+    if k == 0 {
+        // 如果没有更新，直接基于 Base 生成新签名 (或者直接返回 Base? 这里假设刷新签名)
+        return auth_com_from_c(base_c, sk, pp);
+    }
+
+    // 聚合承诺: C* = Sum(C_i) - (k-1) * C_base
+    // 逻辑推导: 
+    // C_1 = Base + D1
+    // C_2 = Base + D2
+    // ...
+    // Sum = k*Base + (D1+D2...)
+    // 我们要的结果是 Base + (D1+D2...) = Sum - (k-1)*Base
+    
+    let mut c_sum = updates[0];
+    for i in 1..k {
+        c_sum = c_sum + updates[i];
+    }
+
+    let mut c_star = c_sum;
+    if k > 1 {
+        let k_minus_1 = Fr::from_u64((k - 1) as u64);
+        c_star = c_sum - (base_c * k_minus_1);
+    }
+
+    // 对聚合后的承诺 C* 生成全新的签名 (宏函数逻辑)
+    auth_com_from_c(c_star, sk, pp)
+}
+
+// 辅助: 已知 C，生成签名 (不涉及 v 和 r)
+fn auth_com_from_c(c: G1, x: Fr, pp: &PP) -> AuthCommitment {
+    let s = Fr::random(); 
+    let s_inv = s.inverse();
+    
+    // Z = (G + x * C) * (1/s)
+    let z = ((pp.g1 + (c * x)) * s_inv);
+    
+    let sigma = ZKSig { 
+        z, 
+        s: pp.g1 * s, 
+        s_hat: pp.g2 * s, 
+        t: pp.p * x * s_inv 
+    };
+    
+    AuthCommitment { c, sigma }
+}
+
+// ==========================================
 // [核心] 第三部分：工具函数
 // ==========================================
 pub mod utils {
@@ -283,7 +382,6 @@ pub mod utils {
     }
 
     pub fn hash256(data: &[u8]) -> Vec<u8> {
-        // println!("[Crypto] 正在执行 Hash256...");
         let mut hasher = Sha256::new();
         hasher.update(data);
         hasher.finalize().to_vec()
@@ -308,24 +406,21 @@ pub mod utils {
     }
 }
 
-// [测试]
 #[cfg(test)]
 mod tests {
     use super::*;
     use utils::*;
 
     #[test]
-    fn test_flow_logs() {
-        println!("--- 测试日志输出 ---");
-        let pp = setup();
-        let kp = key_gen(&pp);
-        let v = Fr::random();
-        let r = Fr::random();
-        let ac = auth_com(v, kp.sk, r, &pp);
-        vf_com(ac.c, v, r, &pp);
-        vf_auth(ac.c, &ac.sigma, kp.vk, &pp);
-        
-        let key = hash256(b"key");
-        let _ = xor_r(r, &key);
+    fn test_data_integrity() {
+        println!("--- 数据完整性测试 ---");
+        let r_origin = Fr::random();
+        let key = hash256(b"test_key");
+        let cipher = xor_r(r_origin, &key);
+        let mut recovered_bytes = vec![0u8; 32];
+        for i in 0..32 { recovered_bytes[i] = cipher[i] ^ key[i % key.len()]; }
+        let r_recovered = recover_r_from_bytes(&recovered_bytes);
+        assert_eq!(r_origin.to_hex(), r_recovered.to_hex());
+        println!("✅ Fr 数据完整性测试通过");
     }
 }
