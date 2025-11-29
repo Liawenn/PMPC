@@ -1,5 +1,5 @@
 use rand::{Rng, RngCore};
-use std::ops::{Add, Mul, Sub}; // [新增] Sub
+use std::ops::{Add, Mul, Sub};
 use std::fmt;
 
 // ==========================================
@@ -133,10 +133,10 @@ pub mod wrapper {
         }
     }
 
-    // --- 运算符重载 (Add, Sub, Mul) ---
+    // --- 运算符重载 ---
     impl Add for Fr { type Output = Fr; fn add(self, rhs: Self) -> Self::Output { let mut ret = unsafe { blst_fr::default() }; unsafe { blst_fr_add(&mut ret, &self.0, &rhs.0) }; Fr(ret) } }
     impl Mul for Fr { type Output = Fr; fn mul(self, rhs: Self) -> Self::Output { let mut ret = unsafe { blst_fr::default() }; unsafe { blst_fr_mul(&mut ret, &self.0, &rhs.0) }; Fr(ret) } }
-    // [新增] Fr 减法
+    
     impl Sub for Fr { 
         type Output = Fr; 
         fn sub(self, rhs: Self) -> Self::Output { 
@@ -147,17 +147,18 @@ pub mod wrapper {
     }
 
     impl Add for G1 { type Output = G1; fn add(self, rhs: Self) -> Self::Output { let mut ret = unsafe { blst_p1::default() }; unsafe { blst_p1_add(&mut ret, &self.0, &rhs.0) }; G1(ret) } }
-    // [新增] G1 减法
+    
     impl Sub for G1 {
         type Output = G1;
         fn sub(self, rhs: Self) -> Self::Output {
             let mut rhs_neg = rhs.0;
-            unsafe { blst_p1_cneg(&mut rhs_neg, true) }; // 取反
+            unsafe { blst_p1_cneg(&mut rhs_neg, true) }; 
             let mut ret = unsafe { blst_p1::default() };
             unsafe { blst_p1_add(&mut ret, &self.0, &rhs_neg) };
             G1(ret)
         }
     }
+
     impl Mul<Fr> for G1 { type Output = G1; fn mul(self, rhs: Fr) -> Self::Output { let mut ret = unsafe { blst_p1::default() }; let mut scalar = unsafe { blst_scalar::default() }; unsafe { blst_scalar_from_fr(&mut scalar, &rhs.0) }; unsafe { blst_p1_mult(&mut ret, &self.0, scalar.b.as_ptr(), 255) }; G1(ret) } }
     impl PartialEq for G1 { fn eq(&self, other: &Self) -> bool { unsafe { blst_p1_is_equal(&self.0, &other.0) } } }
 
@@ -213,12 +214,10 @@ pub fn key_gen(pp: &PP) -> KeyPair {
 pub fn auth_com(v: Fr, x: Fr, r: Fr, pp: &PP) -> AuthCommitment {
     println!("[RSUC] 正在执行 AuthCom (生成承诺)...");
     let c = (pp.g1 * v) + (pp.p * r);
-    
     let s = Fr::random(); 
     let s_inv = s.inverse();
     let z = ((pp.g1 + (c * x)) * s_inv);
     let sigma = ZKSig { z, s: pp.g1 * s, s_hat: pp.g2 * s, t: pp.p * x * s_inv };
-    
     AuthCommitment { c, sigma }
 }
 
@@ -230,11 +229,9 @@ pub fn vf_com(c: G1, v: Fr, r: Fr, pp: &PP) -> bool {
 pub fn vf_auth(c: G1, sigma: &ZKSig, vk: G2, pp: &PP) -> bool {
     println!("[RSUC] 正在执行 VfAuth (验证零知识证明)...");
     if sigma.s.is_infinity() { return false; }
-    
     let ch1 = fp12_eq(&pairing(sigma.s_hat, sigma.z), &fp12_mul(&pairing(pp.g2, pp.g1), &pairing(vk, c)));
     let ch2 = fp12_eq(&pairing(sigma.s_hat, pp.g1), &pairing(pp.g2, sigma.s));
     let ch3 = fp12_eq(&pairing(sigma.s_hat, sigma.t), &pairing(vk, pp.p));
-    
     ch1 && ch2 && ch3
 }
 
@@ -267,90 +264,67 @@ pub fn vf_upd(c: G1, a: Fr, c_new: G1, sigma_new: &ZKSig, vk: G2, pp: &PP) -> bo
     vf_auth(c_new, sigma_new, vk, pp)
 }
 
-// ==========================================
-// [新增功能] 去随机化 & 批量更新
-// ==========================================
-
-// 1. 去随机化 (De-randomization)
-// 公式: C = C_new - r'*P
-//       Z = Z_new - r'*T_new
-//       Other parts remain same
 pub fn unrandomize(c_new: G1, sigma_new: &ZKSig, r_prime: Fr, pp: &PP) -> AuthCommitment {
     println!("[RSUC] 正在执行 Unrandomize (去随机化)...");
-    
-    // 恢复原始承诺: C = C_rand - r' * P
     let c = c_new - (pp.p * r_prime);
-
-    // 恢复 Z: Z = Z_rand - r' * T
     let z = sigma_new.z - (sigma_new.t * r_prime);
-
-    // 构造去随机化后的 Sigma (S, S_hat, T 保持不变)
-    let sigma = ZKSig {
-        z,
-        s: sigma_new.s,
-        s_hat: sigma_new.s_hat,
-        t: sigma_new.t,
-    };
-
+    let sigma = ZKSig { z, s: sigma_new.s, s_hat: sigma_new.s_hat, t: sigma_new.t };
     AuthCommitment { c, sigma }
 }
 
-// 2. 批量更新 (Batch Update / Epoch Aggregation)
-// 公式: C* = Sum(C^i) - (k-1)*C_base  (假设输入 updates 包含 k 个累积状态)
-// 这里我们假设输入是: 基础状态 base_ac, 以及本 Epoch 收到的所有 updates (每个都是相对于 base 的最终状态)
-// 输出: 聚合后的新状态 (带有 Fresh Signature)
-pub fn batch_verify_update(base_c: G1, updates: Vec<G1>, sk: Fr, pp: &PP) -> AuthCommitment {
-    println!("[RSUC] 正在执行 Batch Update (聚合更新)...");
+// ==========================================
+// [关键修复] 批量更新 & 验证
+// ==========================================
+
+// 批量更新: C* = Sum(Ci) + C_sender - k * C_base
+pub fn batch_verify_update(
+    base_c: G1, 
+    sender_c: G1,             // 发送方最新承诺 (Operator存储)
+    updates: Vec<(G1, ZKSig)>, // 接收方承诺列表 (待验证)
+    sk: Fr, 
+    vk: G2,                   // Operator公钥 (用于验证用户提交的更新)
+    pp: &PP
+) -> Option<AuthCommitment> {
+    println!("[RSUC] 正在执行 Batch Update (聚合更新 + 验证)...");
     
     let k = updates.len();
-    if k == 0 {
-        // 如果没有更新，直接基于 Base 生成新签名 (或者直接返回 Base? 这里假设刷新签名)
-        return auth_com_from_c(base_c, sk, pp);
-    }
-
-    // 聚合承诺: C* = Sum(C_i) - (k-1) * C_base
-    // 逻辑推导: 
-    // C_1 = Base + D1
-    // C_2 = Base + D2
-    // ...
-    // Sum = k*Base + (D1+D2...)
-    // 我们要的结果是 Base + (D1+D2...) = Sum - (k-1)*Base
     
-    let mut c_sum = updates[0];
-    for i in 1..k {
-        c_sum = c_sum + updates[i];
+    // 1. 验证所有接收方更新的合法性
+    let mut c_sum = sender_c; // 初始值设为 C_sender (因为公式里是加法)
+
+    for (c, sig) in updates {
+        // 对每一笔收到的款项，Operator 必须验证其签名有效性
+        if !vf_auth(c, &sig, vk, pp) {
+            println!("  ❌ 批量验证失败: 发现非法承诺/签名");
+            return None;
+        }
+        c_sum = c_sum + c;
     }
 
+    // 2. 计算聚合承诺: C* = (Sender_C + Sum(Recv_C)) - k * Base_C
     let mut c_star = c_sum;
-    if k > 1 {
-        let k_minus_1 = Fr::from_u64((k - 1) as u64);
-        c_star = c_sum - (base_c * k_minus_1);
+    if k > 0 {
+        let k_fr = Fr::from_u64(k as u64);
+        let k_base = base_c * k_fr;
+        c_star = c_star - k_base;
     }
 
-    // 对聚合后的承诺 C* 生成全新的签名 (宏函数逻辑)
-    auth_com_from_c(c_star, sk, pp)
+    // 3. 生成新签名
+    // 这里的签名是针对 C* 的，证明 Operator 认可这个新的聚合状态
+    Some(auth_com_from_c(c_star, sk, pp))
 }
 
 // 辅助: 已知 C，生成签名 (不涉及 v 和 r)
 fn auth_com_from_c(c: G1, x: Fr, pp: &PP) -> AuthCommitment {
     let s = Fr::random(); 
     let s_inv = s.inverse();
-    
-    // Z = (G + x * C) * (1/s)
     let z = ((pp.g1 + (c * x)) * s_inv);
-    
-    let sigma = ZKSig { 
-        z, 
-        s: pp.g1 * s, 
-        s_hat: pp.g2 * s, 
-        t: pp.p * x * s_inv 
-    };
-    
+    let sigma = ZKSig { z, s: pp.g1 * s, s_hat: pp.g2 * s, t: pp.p * x * s_inv };
     AuthCommitment { c, sigma }
 }
 
 // ==========================================
-// [核心] 第三部分：工具函数
+// 工具函数
 // ==========================================
 pub mod utils {
     use super::wrapper::*;

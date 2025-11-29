@@ -102,27 +102,25 @@ pub async fn run(
     let init_deadline = sleep(Duration::from_secs(60));
     tokio::pin!(init_deadline);
 
-    // --- 初始化阶段循环 ---
     loop {
         tokio::select! {
             _ = &mut init_deadline => {
                 println!("⏰ 初始化窗口结束，正式开启 Epoch 1 (60s)...");
                 
-                // 广播初始通道状态
                 let st = state.lock().unwrap();
                 let user_list: Vec<String> = st.users.iter().map(|(u, c)| format!("{}:{}", u, c)).collect();
                 let payload = user_list.join(";");
-                drop(st);
+                drop(st); 
 
                 broadcast_msg("CHANNEL_STATE", None, Some(payload), &mut pub_sock, channel_id_bytes).await;
                 println!("    [广播] 初始通道状态已推送");
+
                 broadcast_msg("EPOCH_START_SIGNAL", Some(1), None, &mut pub_sock, channel_id_bytes).await;
                 
                 break; 
             }
             msg = router.recv() => {
                 if let Ok(msg) = msg {
-                    // [修改] 传入 true，允许立即 Join
                     process_msg(msg, state.clone(), &mut router, &mut pub_sock, channel_id_str.clone(), channel_id_bytes, true).await?;
                 }
             }
@@ -132,7 +130,6 @@ pub async fn run(
     let mut epoch_timer = interval(Duration::from_secs(60));
     epoch_timer.tick().await; 
 
-    // --- 正式 Epoch 循环 ---
     loop {
         tokio::select! {
             _ = epoch_timer.tick() => {
@@ -176,7 +173,6 @@ pub async fn run(
 
             msg = router.recv() => {
                 if let Ok(msg) = msg {
-                    // [修改] 传入 false，执行标准的 Epoch 挂起逻辑
                     process_msg(msg, state.clone(), &mut router, &mut pub_sock, channel_id_str.clone(), channel_id_bytes, false).await?;
                 }
             }
@@ -194,7 +190,6 @@ async fn broadcast_msg(type_: &str, round: Option<u64>, content: Option<String>,
     let _ = pub_sock.send(frame).await;
 }
 
-// [修改] 增加 allow_immediate_join 参数
 async fn process_msg(
     msg: zeromq::ZmqMessage,
     state: Arc<Mutex<ChannelState>>,
@@ -202,7 +197,7 @@ async fn process_msg(
     pub_sock: &mut zeromq::PubSocket,
     chan_id_str: String,
     chan_id_bytes: FixedBytes<32>,
-    allow_immediate_join: bool // [新增参数]
+    allow_immediate_join: bool 
 ) -> Result<(), Box<dyn Error>> {
     if let (Some(id_frame), Some(payload_frame)) = (msg.get(0), msg.get(2)) {
         let router_id = id_frame.to_vec();
@@ -213,14 +208,10 @@ async fn process_msg(
             
             match req.r#type.as_str() {
                 "JOIN_REQ" => {
-                    // [修改逻辑]
-                    // 1. 如果是初始化阶段 (allow_immediate_join)，直接处理
-                    // 2. 否则，如果是 Running，挂起
-                    // 3. 如果是 Settling，也挂起 (等 Timer 处理)
                     if allow_immediate_join {
                         handle_join(req, router_id, state.clone(), router, pub_sock, chan_id_str, chan_id_bytes).await?;
                     } else {
-                        println!(">>> [JOIN] 收到请求 -> 挂起 (等待 Epoch 结束)");
+                        println!(">>> [JOIN] 收到请求 -> 挂起 (等待 Epoch 结束批量处理)");
                         state.lock().unwrap().pending_joins.push((req, router_id.clone()));
                         
                         let mut reply = Message::new("WAIT", "OPERATOR");
@@ -256,7 +247,7 @@ async fn handle_join(
     chan_id_alias: String, chan_id_hex: FixedBytes<32>
 ) -> Result<(), Box<dyn Error>> {
     let sender = req.sender.clone();
-    println!(">>> [JOIN] 收到请求: {}", sender);
+    println!(">>> [JOIN] 处理请求: {}", sender);
 
     if let Some(vk_b64) = req.vk {
         if let Ok(pk) = ecp_from_base64(&vk_b64) {
@@ -265,7 +256,6 @@ async fn handle_join(
     }
 
     println!("    - 用户链上注册成功 (Mock)");
-
     let amt_u64 = u64::from_str_radix(&req.amount.unwrap_or("0".into()), 16).unwrap_or(0);
     let v = Fr::from_u64(amt_u64);
     let r = Fr::random(); 
@@ -282,7 +272,6 @@ async fn handle_join(
     {
         let mut st = state.lock().unwrap();
         st.users.insert(sender.clone(), ecp_to_base64(ac.c));
-        // 注意：初始化阶段的 handle_join 不广播全量，等初始化结束统一广播
         println!("    - 用户 {} 已加入状态树", sender);
     }
     
@@ -374,6 +363,7 @@ async fn handle_update(
     Ok(())
 }
 
+// [关键修复] 处理 Epoch 汇报，使用正确的参数数量
 async fn handle_epoch_report(
     req: Message, router_id: Vec<u8>, state: Arc<Mutex<ChannelState>>, router: &mut zeromq::RouterSocket
 ) -> Result<(), Box<dyn Error>> {
@@ -383,25 +373,30 @@ async fn handle_epoch_report(
     if let Some(updates) = req.epoch_updates {
         if !updates.is_empty() {
             println!("    - 包含 {} 笔交易，正在聚合...", updates.len());
-            let (sk, pp, base_c_str) = {
+            let (sk, vk, pp, base_c_str) = {
                 let st = state.lock().unwrap();
                 let base = st.users.get(&sender).unwrap().clone(); 
-                (st.kp.sk, st.pp.clone(), base)
+                (st.kp.sk, st.kp.vk, st.pp.clone(), base)
             };
             
             let base_c = ecp_from_base64(&base_c_str)?;
-            let mut c_list = Vec::new();
-            c_list.push(base_c); 
+            // 接收方聚合列表: [(C, Sig), (C, Sig)...]
+            let mut updates_list = Vec::new();
+            
             for item in updates {
-                if let Ok(c) = ecp_from_base64(&item.commitment) {
-                    c_list.push(c);
-                }
+                let c = ecp_from_base64(&item.commitment)?;
+                let sig = zksig_from_base64(&item.signature)?;
+                updates_list.push((c, sig));
             }
 
-            let new_ac = batch_verify_update(base_c, c_list, sk, &pp);
-            
-            state.lock().unwrap().users.insert(sender.clone(), ecp_to_base64(new_ac.c));
-            println!("    - 用户状态已聚合更新 (New C) ✅");
+            // [修复] 传入 base_c 作为 sender_c (假设用户汇报是基于当前最新状态)
+            // 参数顺序: base_c, sender_c, updates, sk, vk, pp
+            if let Some(new_ac) = batch_verify_update(base_c, base_c, updates_list, sk, vk, &pp) {
+                state.lock().unwrap().users.insert(sender.clone(), ecp_to_base64(new_ac.c));
+                println!("    - 用户状态已聚合更新 (New C) ✅");
+            } else {
+                println!("    ❌ 批量更新验证失败，状态未更新");
+            }
         } else {
             println!("    - 无更新 (Empty)");
         }
