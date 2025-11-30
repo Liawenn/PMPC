@@ -1,7 +1,6 @@
 use crate::config::ActorConfig;
 use alloy::{
     network::EthereumWallet,
-    // [修复] 在这里添加 Bytes
     primitives::{Address, U256, FixedBytes, Bytes}, 
     providers::{Provider, ProviderBuilder},
     signers::local::PrivateKeySigner,
@@ -11,14 +10,14 @@ use std::error::Error;
 use std::str::FromStr;
 use url::Url;
 
-// 加载 ABI (现在包含了 createChannel)
+// 加载 ABI
 sol!(
     #[sol(rpc)]
     Channel,
     "abi/Channel.json"
 );
 
-// 1. 锁币函数 (保持不变，为了完整性我贴在这里)
+// 1. 锁币函数 (用户/Operator 调用)
 pub async fn lock_deposit(
     actor: &ActorConfig, 
     rpc_url: &str, 
@@ -39,33 +38,23 @@ pub async fn lock_deposit(
     Ok(())
 }
 
-// 2. [新增] 创建通道函数
+// 2. 创建通道 (Operator 调用)
 pub async fn create_channel(
     actor: &ActorConfig,
     rpc_url: &str,
     contract_address: Address,
-    channel_id: FixedBytes<32> // Solidity 的 bytes32 对应 Rust 的 FixedBytes<32>
+    channel_id: FixedBytes<32> 
 ) -> Result<String, Box<dyn Error>> {
-    // 设置 Provider
     let signer: PrivateKeySigner = actor.private_key.parse()?;
-    let wallet = EthereumWallet::from(signer);
-    let provider = ProviderBuilder::new().wallet(wallet).on_http(Url::parse(rpc_url)?);
-    
-    // 实例化合约
+    let provider = ProviderBuilder::new().wallet(EthereumWallet::from(signer)).on_http(Url::parse(rpc_url)?);
     let contract = Channel::new(contract_address, provider);
 
-    // 调用 createChannel
-    // 注意：createChannel 是 non-payable 的，不需要 .value()
     let tx_builder = contract.createChannel(channel_id);
-    
-    // 发送并等待回执
     let receipt = tx_builder.send().await?.get_receipt().await?;
-    
-    // 返回交易哈希字符串
     Ok(receipt.transaction_hash.to_string())
 }
 
-// [新增] 1. Operator 上传 RSUC 参数
+// 3. 上传 RSUC 参数 (Operator 调用)
 pub async fn setup_rsuc(
     actor: &ActorConfig,
     rpc_url: &str,
@@ -77,7 +66,6 @@ pub async fn setup_rsuc(
     let provider = ProviderBuilder::new().wallet(EthereumWallet::from(signer)).on_http(Url::parse(rpc_url)?);
     let contract = Channel::new(contract_addr, provider);
 
-    // 调用 setupRSUC (注意参数类型转换)
     let tx = contract.setupRSUC(
         channel_id, Bytes::from(g1), Bytes::from(p), Bytes::from(g2), Bytes::from(ord), Bytes::from(vk)
     );
@@ -85,8 +73,7 @@ pub async fn setup_rsuc(
     Ok(receipt.transaction_hash.to_string())
 }
 
-// [新增] 2. User 获取 RSUC 参数
-// 返回 (G1, P, G2, Ord, Vk) 的字节数组元组
+// 4. 获取 RSUC 参数 (User 调用)
 pub async fn get_rsuc_info(
     rpc_url: &str,
     contract_addr: Address,
@@ -96,7 +83,6 @@ pub async fn get_rsuc_info(
     let contract = Channel::new(contract_addr, provider);
     
     let result = contract.getRSUCInfo(channel_id).call().await?;
-    // result 是一个生成的结构体/元组，包含 returns 里的字段
     Ok((
         result.G1.to_vec(), 
         result.P.to_vec(), 
@@ -104,4 +90,43 @@ pub async fn get_rsuc_info(
         result.curveOrder.to_vec(), 
         result.vk.to_vec()
     ))
+}
+
+// [新增] 5. 用户加入通道 (Operator 调用)
+// Operator 在链下验证完 Join 请求后，调用此函数在链上登记
+pub async fn join_channel(
+    actor: &ActorConfig,
+    rpc_url: &str,
+    contract_addr: Address,
+    channel_id: FixedBytes<32>,
+    user_addr: Address
+) -> Result<String, Box<dyn Error>> {
+    let signer: PrivateKeySigner = actor.private_key.parse()?;
+    let provider = ProviderBuilder::new().wallet(EthereumWallet::from(signer)).on_http(Url::parse(rpc_url)?);
+    let contract = Channel::new(contract_addr, provider);
+
+    let tx = contract.joinChannel(channel_id, user_addr);
+    let receipt = tx.send().await?.get_receipt().await?;
+    Ok(receipt.transaction_hash.to_string())
+}
+
+// [新增] 6. Operator 授权提现 (Operator 调用)
+// Operator 验证完 Exit 请求和余额后，调用此函数给用户转账
+pub async fn operator_withdraw(
+    actor: &ActorConfig,
+    rpc_url: &str,
+    contract_addr: Address,
+    channel_id: FixedBytes<32>,
+    user_addr: Address,
+    amount_wei: u128
+) -> Result<String, Box<dyn Error>> {
+    let signer: PrivateKeySigner = actor.private_key.parse()?;
+    let provider = ProviderBuilder::new().wallet(EthereumWallet::from(signer)).on_http(Url::parse(rpc_url)?);
+    let contract = Channel::new(contract_addr, provider);
+
+    let amount = U256::from(amount_wei);
+    
+    let tx = contract.operatorWithdraw(channel_id, user_addr, amount);
+    let receipt = tx.send().await?.get_receipt().await?;
+    Ok(receipt.transaction_hash.to_string())
 }

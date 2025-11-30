@@ -20,6 +20,7 @@ use alloy::primitives::{FixedBytes, U256};
 use std::str::FromStr;
 use base64::{Engine as _, engine::general_purpose};
 
+// --- UX 辅助函数 ---
 fn print_menu() {
     println!("\n==============================================================");
     println!("  命令列表:");
@@ -29,7 +30,7 @@ fn print_menu() {
     println!("  4. epoch                   - (调试) 手动触发本地结算");
     println!("  5. balance                 - 查看本地余额和状态");
     println!("  6. help                    - 显示此菜单");
-    println!("  7. exit                    - 退出客户端");
+    println!("  7. exit                    - 申请提现并退出");
     println!("==============================================================\n");
 }
 
@@ -66,8 +67,16 @@ pub async fn run(
         }
     }
 
+    // 1. 初始化共享状态
     let wallet = Arc::new(Mutex::new(UserWallet::new(initial_deposit.unwrap_or(0))));
+    
+    // [关键修复] pp 必须是共享状态，且在 spawn 之前定义
+    let pp_shared = Arc::new(Mutex::new(None::<PP>));
+    // 缓存的其他状态也建议共享，以免闭包捕获问题
+    let cached_vk_shared = Arc::new(Mutex::new(None::<G2>)); 
+    let channel_id_shared = Arc::new(Mutex::new(None::<String>));
 
+    // 2. 连接网络
     let mut dealer = zeromq::DealerSocket::new();
     let op_host = op.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
     let op_port = op.port.unwrap_or(5555);
@@ -80,14 +89,17 @@ pub async fn run(
     let p2p_port = me.port.unwrap_or(6000);
     let p2p_listener = TcpListener::bind(format!("0.0.0.0:{}", p2p_port)).await?;
 
+    // 克隆 Arc 用于 P2P 线程
     let wallet_p2p = wallet.clone();
-    let me_name_p2p = me.name.clone();
+    let pp_p2p = pp_shared.clone(); 
     
-    // P2P 任务
+    // 3. P2P 后台任务
     tokio::spawn(async move {
         loop {
             if let Ok((mut socket, _)) = p2p_listener.accept().await {
                 let w = wallet_p2p.clone();
+                let pp_lock = pp_p2p.clone(); 
+                
                 tokio::spawn(async move {
                     let mut buf_reader = BufReader::new(&mut socket);
                     let mut line = String::new();
@@ -110,23 +122,24 @@ pub async fn run(
                                 
                                 if let (Some(c_str), Some(sig_str)) = (msg.commitment, msg.signature) {
                                     if let (Ok(c), Ok(sig)) = (ecp_from_base64(&c_str), zksig_from_base64(&sig_str)) {
-                                        // 注意：P2P 线程没有 PP，无法去随机化。Demo 中跳过 unrandomize。
-                                        // 实际项目需共享 PP。
-                                        // 这里直接存入 Buffer，假设已经去随机化 (Mock)
-                                        // 为了跑通流程，我们不调用 buffer_incoming_update (因为缺 PP)
-                                        // 而是直接构造 item push 进去
+                                        let new_ac = AuthCommitment { c, sigma: sig };
                                         let amt = u64::from_str_radix(&msg.amount.unwrap(), 16).unwrap_or(0);
-                                        let item = crate::models::EpochUpdateItem {
-                                            commitment: c_str,
-                                            signature: sig_str, // 原始 base64
-                                            amount_hex: format!("{:x}", amt),
-                                        };
                                         
-                                        let mut w_lock = w.lock().unwrap();
-                                        w_lock.epoch_buffer.push(item);
-                                        w_lock.current_epoch_income += U256::from(amt);
+                                        let mut wallet_lock = w.lock().unwrap();
                                         
-                                        println!("💰 收款暂存! Pending: {} wei (主余额: {})", w_lock.current_epoch_income, w_lock.amount);
+                                        // [修复] 获取共享的 PP
+                                        let pp_guard = pp_lock.lock().unwrap();
+                                        if let Some(ref pp_ref) = *pp_guard {
+                                            // 调用 buffer_incoming_update 并传入 pp
+                                            wallet_lock.buffer_incoming_update(new_ac, U256::from(amt), pp_ref);
+                                            
+                                            println!("💰 收款暂存! Pending: {} wei (主余额: {})", wallet_lock.current_epoch_income, wallet_lock.amount);
+                                        } else {
+                                            // 如果还没 Join，没有 PP，无法去随机化，只能暂存或报错
+                                            // 这里为了不崩，可以只打印警告
+                                            println!("⚠️ 警告: 收到转账但尚未 Join (无PP)，无法去随机化/存入");
+                                        }
+                                        
                                         print!("(按回车恢复提示符...) ");
                                         use std::io::Write; let _ = std::io::stdout().flush();
                                     }
@@ -138,10 +151,6 @@ pub async fn run(
             }
         }
     });
-
-    let mut pp: Option<PP> = None;
-    let mut cached_op_vk: Option<G2> = None; 
-    let mut assigned_channel_id: Option<String> = None;
 
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     println!("\n{} 准备就绪.", me.name);
@@ -159,47 +168,62 @@ pub async fn run(
                         "join" => {
                             if parts.len() < 2 { println!("❌ 用法: join <hex_id>"); print_prompt(&me.name); continue; }
                             let ch_id = parts[1];
-                            assigned_channel_id = Some(ch_id.to_string());
+                            *channel_id_shared.lock().unwrap() = Some(ch_id.to_string());
                             sub.subscribe(ch_id).await?;
                             
                             let ch_id_bytes = match FixedBytes::<32>::from_str(ch_id) {
                                 Ok(b) => b, Err(_) => { println!("❌ Hex ID 格式错误"); print_prompt(&me.name); continue; }
                             };
                             
+                            // 获取锁来更新 PP
+                            let mut pp_guard = pp_shared.lock().unwrap();
+                            let mut vk_guard = cached_vk_shared.lock().unwrap();
+
                             if let Some(conf) = &contracts {
                                 println!("⏳ 正在从链上获取 RSUC 参数...");
                                 match blockchain::get_rsuc_info(&rpc_url, conf.payment_channel, ch_id_bytes).await {
                                     Ok((g1_b, p_b, g2_b, _, vk_b)) => {
                                         if g1_b.len() != 48 {
-                                            println!("⚠️ 链上数据为空 -> 切换 Mock");
-                                            pp = Some(RSUC::setup());
-                                            cached_op_vk = Some(G2::generator());
+                                            println!("⚠️ 链上数据无效 -> 切换 Mock");
+                                            *pp_guard = Some(RSUC::setup());
+                                            *vk_guard = Some(G2::generator());
                                         } else {
                                             let g1 = G1::from_hex(&hex::encode(g1_b)).unwrap_or(G1::generator());
                                             let p  = G1::from_hex(&hex::encode(p_b)).unwrap_or(G1::generator());
                                             let g2 = G2::from_hex(&hex::encode(g2_b)).unwrap_or(G2::generator());
                                             let vk = G2::from_hex(&hex::encode(vk_b)).unwrap_or(G2::generator());
-                                            cached_op_vk = Some(vk);
-                                            pp = Some(PP { g1, p, g2 });
+                                            
+                                            // [关键修复] 更新共享状态
+                                            *pp_guard = Some(PP { g1, p, g2 });
+                                            *vk_guard = Some(vk);
                                             println!("[INFO] RSUC 参数加载成功");
                                         }
                                     },
                                     Err(_) => { 
-                                        println!("⚠️ 读取失败 -> 切换 Mock");
-                                        pp = Some(RSUC::setup()); 
-                                        cached_op_vk = Some(G2::generator()); 
+                                        println!("⚠️ 读取合约失败 -> 切换 Mock");
+                                        *pp_guard = Some(RSUC::setup()); 
+                                        *vk_guard = Some(G2::generator()); 
                                     }
                                 }
-                            } else { pp = Some(RSUC::setup()); cached_op_vk = Some(G2::generator()); }
+                            } else { 
+                                *pp_guard = Some(RSUC::setup()); 
+                                *vk_guard = Some(G2::generator()); 
+                            }
 
-                            let temp_pp = pp.as_ref().unwrap();
-                            let pk = wallet.lock().unwrap().gen_schnorr_keys(temp_pp);
+                            let pk = wallet.lock().unwrap().gen_schnorr_keys(pp_guard.as_ref().unwrap());
+                            // 释放锁，避免死锁
+                            drop(pp_guard);
+                            drop(vk_guard);
+
                             let cur_amt = wallet.lock().unwrap().amount;
-                            
                             let mut req = Message::new("JOIN_REQ", &me.name);
                             req.channel_id = Some(ch_id.to_string());
                             req.amount = Some(format!("{:x}", cur_amt)); 
                             req.vk = Some(ecp_to_base64(pk)); 
+                            
+                            // [✅ 修复点] 必须将 content 设置为当前用户的以太坊地址
+                            req.content = Some(me.address.to_string());
+
                             let mut z = zeromq::ZmqMessage::from(vec![]);
                             z.push_back(serde_json::to_string(&req)?.into());
                             dealer.send(z).await?;
@@ -211,13 +235,17 @@ pub async fn run(
                             if let Some(port) = full_config.get_user_port(target) {
                                 let host = full_config.get_user_host(target).unwrap();
                                 let mut w = wallet.lock().unwrap();
-                                if let Some(pp_ref) = &pp {
+                                
+                                let pp_guard = pp_shared.lock().unwrap();
+                                if let Some(pp_ref) = pp_guard.as_ref() {
                                     w.prepare_reception_for_sharing(pp_ref);
                                     let recv_state = w.reception.as_ref().unwrap();
                                     let mut m = Message::new("EXCHANGE_INFO", &me.name);
                                     m.commitment = Some(ecp_to_base64(recv_state.ac.c));
                                     m.signature = Some(zksig_to_base64(&recv_state.ac.sigma));
                                     drop(w); 
+                                    drop(pp_guard);
+
                                     if let Err(e) = p2p_send(&host, port, &m).await {
                                         println!("❌ P2P 发送失败: {}", e);
                                     } else {
@@ -231,18 +259,39 @@ pub async fn run(
                             if parts.len() < 3 { println!("❌ 用法: send <amount> <target>"); print_prompt(&me.name); continue; }
                             let amt_u64: u64 = parts[1].parse().unwrap_or(0);
                             let target = parts[2];
+                            
                             let mut w = wallet.lock().unwrap();
-                            if !w.peer_receptions.contains_key(target) { println!("❌ 无目标地址"); print_prompt(&me.name); continue; }
-                            
-                            if w.pending_amount < U256::from(amt_u64) { println!("❌ 余额不足"); print_prompt(&me.name); continue; }
-                            let remaining = (w.pending_amount - U256::from(amt_u64)).to::<u64>(); 
-
-                            println!("⏳ 生成区间证明...");
-                            let base_r = w.base.as_ref().unwrap().r;
-                            let (proof_b64, com_b64) = range_proof::generate_proof(w.pending_amount.to::<u64>(), amt_u64, &base_r, pp.as_ref().unwrap()).unwrap();
-                            
-                            let base_ac = &w.base.as_ref().unwrap().ac;
+                            if !w.peer_receptions.contains_key(target) {
+                                println!("❌ 无目标地址，请先: share_addr {}", target); 
+                                print_prompt(&me.name);
+                                continue; 
+                            }
                             let recv_ac = w.peer_receptions.get(target).unwrap().clone();
+                            let amt_u256 = U256::from(amt_u64);
+                            
+                            if w.pending_amount < amt_u256 { 
+                                println!("❌ 余额不足 (Pending: {}, 需: {})", w.pending_amount, amt_u256); 
+                                print_prompt(&me.name);
+                                continue; 
+                            }
+                            let remaining = (w.pending_amount - amt_u256).to::<u64>(); 
+                            
+                            // [修改] 使用共享的 PP
+                            let pp_guard = pp_shared.lock().unwrap();
+                            let pp_ref = pp_guard.as_ref().unwrap(); 
+                            let base_r = w.base.as_ref().unwrap().r;
+                            let current_v = w.pending_amount.to::<u64>();
+
+                            println!("⏳ 生成区间证明 ({} -> {})...", current_v, remaining);
+                            let (proof_b64, com_b64) = range_proof::generate_proof(
+                                current_v, 
+                                amt_u64, 
+                                &base_r, 
+                                pp_ref
+                            ).unwrap();
+                            println!("✅ 区间证明生成完毕");
+
+                            let base_ac = &w.base.as_ref().unwrap().ac;
                             let tx = TransactionTx {
                                 sender_commitment: ecp_to_base64(base_ac.c),
                                 sender_zk_sig: zksig_to_base64(&base_ac.sigma),
@@ -254,31 +303,78 @@ pub async fn run(
                                 timestamp: 0,
                             };
                             let tx_json = serde_json::to_string(&tx)?;
-                            let sk = w.schnorr_sk.unwrap(); 
-                            let sig = schnorr::sign(&tx_json, sk, pp.as_ref().unwrap().g1);
                             
+                            let sk = w.schnorr_sk.unwrap(); 
+                            let sig = schnorr::sign(&tx_json, sk, pp_ref.g1);
+                            drop(pp_guard); // 释放
+
+                            let cid_guard = channel_id_shared.lock().unwrap();
                             let mut req = Message::new("UPDATE_REQ", &me.name);
-                            req.channel_id = assigned_channel_id.clone();
+                            req.channel_id = cid_guard.clone();
                             req.tx_data = Some(tx_json);
                             req.schnorr_sig = Some(schnorr::sig_to_base64(&sig));
                             req.content = Some(target.to_string());
+                            
                             drop(w);
                             let mut z = zeromq::ZmqMessage::from(vec![]);
                             z.push_back(serde_json::to_string(&req)?.into());
                             dealer.send(z).await?;
-                            println!("[INFO] 交易请求已发送");
+                            println!("[INFO] 交易请求已发送 (ID: {}, Target: {})", req.request_id.unwrap(), target);
                         },
-                        "epoch" => { wallet.lock().unwrap().settle_epoch(); print_prompt(&me.name); },
+                        "epoch" => {
+                            let mut w = wallet.lock().unwrap();
+                            w.settle_epoch(); 
+                            print_prompt(&me.name);
+                        },
                         "balance" => {
                             let w = wallet.lock().unwrap();
                             println!("\n💰 当前状态:");
                             println!("   主余额 (Settled): {} wei", w.amount);
                             println!("   Pending 余额:     {} wei", w.pending_amount);
                             println!("   本轮暂收:         +{} wei", w.current_epoch_income);
+                            
+                            let pp_guard = pp_shared.lock().unwrap();
+                            println!("   Join 状态: {}", if pp_guard.is_some() { "✅ 已加入" } else { "❌ 未加入" });
                             print_prompt(&me.name);
                         },
+                        "exit" => {
+                            let w = wallet.lock().unwrap();
+                            let pp_guard = pp_shared.lock().unwrap(); 
+
+                            if w.base.is_none() || w.schnorr_sk.is_none() || pp_guard.is_none() {
+                                println!("❌ 无法退出：钱包未初始化或未加入通道");
+                                print_prompt(&me.name); continue;
+                            }
+                            
+                            let amount = w.amount.to::<u64>(); 
+                            let r = w.base.as_ref().unwrap().r;
+                            let sk = w.schnorr_sk.unwrap();
+                            let pp_ref = pp_guard.as_ref().unwrap();
+
+                            let amount_hex = format!("{:x}", amount);
+                            let r_hex = r.to_hex();
+
+                            println!("⏳ 正在向 Operator 提交退出申请 (余额: {} wei)...", amount);
+
+                            let mut req = Message::new("EXIT_REQ", &me.name);
+                            req.channel_id = channel_id_shared.lock().unwrap().clone();
+                            req.amount = Some(amount_hex.clone());
+                            req.r_reveal = Some(r_hex.clone()); 
+                            req.content = Some(me.address.to_string());
+
+                            let sig_payload = format!("EXIT{}{}", amount_hex, r_hex);
+                            let sig = schnorr::sign(&sig_payload, sk, pp_ref.g1);
+                            req.schnorr_sig = Some(schnorr::sig_to_base64(&sig));
+
+                            drop(w);
+                            drop(pp_guard);
+
+                            let mut z = zeromq::ZmqMessage::from(vec![]);
+                            z.push_back(serde_json::to_string(&req)?.into());
+                            dealer.send(z).await?;
+                        },
                         "help" => { print_menu(); print_prompt(&me.name); },
-                        "exit" => break,
+                        "quit" => break,
                         _ => { println!("❌ 未知命令"); print_prompt(&me.name); },
                     }
                 }
@@ -290,17 +386,22 @@ pub async fn run(
                         let json = String::from_utf8_lossy(payload);
                         if let Ok(resp) = serde_json::from_str::<Message>(&json) {
                             if resp.r#type == "OK_JOIN" {
-                                let local_pp = pp.as_ref().unwrap();
                                 let c = ecp_from_base64(&resp.commitment.unwrap()).unwrap();
                                 let sigma = zksig_from_base64(&resp.signature.unwrap()).unwrap();
                                 let cipher = general_purpose::STANDARD.decode(resp.cipher_r.unwrap()).unwrap();
-                                let chain_vk = cached_op_vk.unwrap();
+                                
+                                let vk_guard = cached_vk_shared.lock().unwrap();
+                                let chain_vk = vk_guard.unwrap();
+                                let pp_guard = pp_shared.lock().unwrap();
+                                let local_pp = pp_guard.as_ref().unwrap();
+
                                 let vk_b64 = ecp2_to_base64(chain_vk);
                                 let key = hash256(format!("{}{}", vk_b64, me.name).as_bytes());
                                 let mut r_bytes = vec![0u8; cipher.len()];
                                 for i in 0..cipher.len() { r_bytes[i] = cipher[i] ^ key[i % key.len()]; }
                                 let r = recover_r_from_bytes(&r_bytes);
                                 let ac = AuthCommitment { c, sigma };
+                                
                                 wallet.lock().unwrap().init_from_operator(ac, r, local_pp);
                                 println!("[SUCCESS] 加入成功！");
                                 print_prompt(&me.name); 
@@ -315,7 +416,10 @@ pub async fn run(
 
                                 let mut w = wallet.lock().unwrap();
                                 let new_pending = w.pending_amount - U256::from(amt);
-                                w.apply_update_as_sender(new_ac, new_pending, pp.as_ref().unwrap());
+                                
+                                let pp_guard = pp_shared.lock().unwrap();
+                                w.apply_update_as_sender(new_ac, new_pending, pp_guard.as_ref().unwrap());
+                                drop(pp_guard);
                                 
                                 if let Some(port) = full_config.get_user_port(&target_name) {
                                     let host = full_config.get_user_host(&target_name).unwrap();
@@ -332,7 +436,17 @@ pub async fn run(
                             } else if resp.r#type == "EPOCH_ACK" {
                                 println!("\n✅ [EPOCH] 收到 Operator 确认，结算完成！");
                                 wallet.lock().unwrap().settle_epoch();
+                                
+                                // [UX 优化] 提示用户可以退出
+                                println!("✅ [提示] 本轮结算完毕，您现在可以安全执行 exit 提现，或继续进行下一轮交易。");
+
                                 print_prompt(&me.name);
+
+                            } else if resp.r#type == "EXIT_ACK" {
+                                println!("\n✅ [EXIT] 提现成功！Operator 已触发链上转账。");
+                                println!("👋 客户端即将退出...");
+                                std::process::exit(0);
+                            
                             } else if resp.r#type == "WAIT" {
                                 println!("\n⏳ 请求已挂起：Operator 正在结算中...");
                                 print_prompt(&me.name);
@@ -360,12 +474,15 @@ pub async fn run(
                             } else if msg.r#type == "EPOCH_END_SIGNAL" {
                                 println!("\n⏰ [EPOCH] 收到结束信号 (Round {})", msg.epoch_round.unwrap_or(0));
                                 println!("    正在提交本轮交易记录...");
+                                
                                 let mut w = wallet.lock().unwrap();
                                 let updates = w.epoch_buffer.clone();
                                 drop(w); 
+
                                 let mut report = Message::new("EPOCH_REQ", &me.name);
                                 report.epoch_updates = Some(updates);
-                                report.channel_id = assigned_channel_id.clone();
+                                report.channel_id = channel_id_shared.lock().unwrap().clone();
+                                
                                 let mut z = zeromq::ZmqMessage::from(vec![]);
                                 z.push_back(serde_json::to_string(&report)?.into());
                                 dealer.send(z).await?;

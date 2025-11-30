@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+// [修复] 删除了 use crate::models::EpochUpdateItem; 这一行
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message {
@@ -27,6 +28,9 @@ pub struct Message {
     // Epoch 相关
     #[serde(default)] pub epoch_updates: Option<Vec<EpochUpdateItem>>,
     #[serde(default)] pub epoch_round: Option<u64>,
+
+    // Exit 相关
+    #[serde(default)] pub r_reveal: Option<String>, 
 }
 
 impl Message {
@@ -41,10 +45,12 @@ impl Message {
             sender_commitment: None, sender_zk_sig: None,
             receiver_commitment: None, receiver_zk_sig: None,
             epoch_updates: None, epoch_round: None,
+            r_reveal: None,
         }
     }
 }
 
+// 交易结构体
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TransactionTx {
     pub sender_commitment: String,
@@ -57,10 +63,10 @@ pub struct TransactionTx {
     pub timestamp: u64,
 }
 
-// [修复] 补全字段
+// Epoch 汇报条目
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EpochUpdateItem {
     pub commitment: String, 
     pub signature: String,  
-    pub amount_hex: String, // [新增] 修复报错
+    pub amount_hex: String,
 }
