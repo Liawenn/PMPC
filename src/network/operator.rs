@@ -211,9 +211,8 @@ async fn process_msg(
                     if allow_immediate_join {
                         handle_join(req, router_id, state.clone(), router, pub_sock, chan_id_str, chan_id_bytes).await?;
                     } else {
-                        println!(">>> [JOIN] 收到请求 -> 挂起 (等待 Epoch 结束批量处理)");
+                        println!(">>> [JOIN] 收到请求 -> 挂起 (等待 Epoch 结束)");
                         state.lock().unwrap().pending_joins.push((req, router_id.clone()));
-                        
                         let mut reply = Message::new("WAIT", "OPERATOR");
                         reply.content = Some("请求已挂起，等待 Epoch 结束".into());
                         let mut resp = zeromq::ZmqMessage::from(router_id);
@@ -247,7 +246,7 @@ async fn handle_join(
     chan_id_alias: String, chan_id_hex: FixedBytes<32>
 ) -> Result<(), Box<dyn Error>> {
     let sender = req.sender.clone();
-    println!(">>> [JOIN] 处理请求: {}", sender);
+    println!(">>> [JOIN] 收到请求: {}", sender);
 
     if let Some(vk_b64) = req.vk {
         if let Ok(pk) = ecp_from_base64(&vk_b64) {
@@ -256,9 +255,11 @@ async fn handle_join(
     }
 
     println!("    - 用户链上注册成功 (Mock)");
+
     let amt_u64 = u64::from_str_radix(&req.amount.unwrap_or("0".into()), 16).unwrap_or(0);
     let v = Fr::from_u64(amt_u64);
     let r = Fr::random(); 
+    println!("    [Debug] Generated Random r: {}", r.to_hex());
     
     let (ac, vk) = {
         let st = state.lock().unwrap();
@@ -321,7 +322,16 @@ async fn handle_update(
         println!("❌ 签名验证失败"); return Ok(());
     }
 
-    if !range_proof::verify_proof(&tx.range_proof, &tx.range_com) {
+    let amt_val = u64::from_str_radix(&tx.amount, 16)?;
+
+    // [关键修改] 验证区间证明
+    // 使用 range_proof::verify_proof 验证
+    if !range_proof::verify_proof(
+        &tx.range_proof, 
+        &tx.sender_commitment, // 传入 Sender 的 Commitment (Base64)
+        amt_val, 
+        &pp
+    ) {
         println!("❌ 区间证明无效"); return Ok(());
     }
     println!("    - 验证区间证明... ✅");
@@ -332,7 +342,6 @@ async fn handle_update(
         println!("❌ 接收方承诺无效"); return Ok(());
     }
 
-    let amt_val = u64::from_str_radix(&tx.amount, 16)?;
     let amt_fr = Fr::from_u64(amt_val);
     
     println!("    - 执行同态更新... (Sender -{}, Recv +{})", amt_val, amt_val);
@@ -363,7 +372,6 @@ async fn handle_update(
     Ok(())
 }
 
-// [关键修复] 处理 Epoch 汇报，使用正确的参数数量
 async fn handle_epoch_report(
     req: Message, router_id: Vec<u8>, state: Arc<Mutex<ChannelState>>, router: &mut zeromq::RouterSocket
 ) -> Result<(), Box<dyn Error>> {
@@ -380,22 +388,18 @@ async fn handle_epoch_report(
             };
             
             let base_c = ecp_from_base64(&base_c_str)?;
-            // 接收方聚合列表: [(C, Sig), (C, Sig)...]
             let mut updates_list = Vec::new();
-            
             for item in updates {
-                let c = ecp_from_base64(&item.commitment)?;
-                let sig = zksig_from_base64(&item.signature)?;
-                updates_list.push((c, sig));
+                if let (Ok(c), Ok(sig)) = (ecp_from_base64(&item.commitment), zksig_from_base64(&item.signature)) {
+                    updates_list.push((c, sig));
+                }
             }
 
-            // [修复] 传入 base_c 作为 sender_c (假设用户汇报是基于当前最新状态)
-            // 参数顺序: base_c, sender_c, updates, sk, vk, pp
             if let Some(new_ac) = batch_verify_update(base_c, base_c, updates_list, sk, vk, &pp) {
                 state.lock().unwrap().users.insert(sender.clone(), ecp_to_base64(new_ac.c));
                 println!("    - 用户状态已聚合更新 (New C) ✅");
             } else {
-                println!("    ❌ 批量更新验证失败，状态未更新");
+                println!("    ❌ 批量更新验证失败");
             }
         } else {
             println!("    - 无更新 (Empty)");

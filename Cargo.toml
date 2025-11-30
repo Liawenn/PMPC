@@ -21,10 +21,15 @@ include_dir = "0.7"
 url = "2.5.7"
 # 密码学
 blst = { version = "0.3", features = ["portable"] }
-rand = "0.9.2"
+rand = "0.8"
 hex = "0.4"
 # ... 其他依赖 ...
 uuid = { version = "1.0", features = ["v4", "fast-rng"] }
 base64 = "0.22.1"
 sha2 = "0.10" # 用于 hash256
-bls_bulletproofs = "*"
+# bls_bulletproofs = "*"
+bls_bulletproofs = "1.1.1"
+blstrs = "=0.6.2" 
+group = "0.12" 
+ff = "0.12"
+merlin = "3.0.0"
