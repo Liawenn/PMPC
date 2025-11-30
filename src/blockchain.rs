@@ -130,3 +130,24 @@ pub async fn operator_withdraw(
     let receipt = tx.send().await?.get_receipt().await?;
     Ok(receipt.transaction_hash.to_string())
 }
+
+// [新增] 7. 关闭通道 (Operator 调用)
+// 当所有用户都退出后，Operator 调用此函数关闭通道并取回保证金
+pub async fn close_channel(
+    actor: &ActorConfig,
+    rpc_url: &str,
+    contract_addr: Address,
+    channel_id: FixedBytes<32>
+) -> Result<String, Box<dyn Error>> {
+    let signer: PrivateKeySigner = actor.private_key.parse()?;
+    let provider = ProviderBuilder::new().wallet(EthereumWallet::from(signer)).on_http(Url::parse(rpc_url)?);
+    let contract = Channel::new(contract_addr, provider);
+
+    println!("🔒 [{}] 正在发起关闭通道请求 (Channel ID: {})...", actor.name, channel_id);
+
+    // 调用合约的 closeChannel 函数
+    let tx = contract.closeChannel(channel_id);
+    let receipt = tx.send().await?.get_receipt().await?;
+    
+    Ok(receipt.transaction_hash.to_string())
+}

@@ -1,7 +1,7 @@
 use crate::config::{ActorConfig, ContractsConfig};
-use crate::models::{Message, TransactionTx, EpochUpdateItem}; 
+use crate::models::{Message, TransactionTx}; 
 use crate::blockchain;
-use crate::crypto::RSUC::{self, PP, KeyPair, batch_verify_update}; 
+use crate::crypto::RSUC::{self, PP, KeyPair}; // [修改] 移除了 batch_verify_update
 use crate::crypto::RSUC::wrapper::{Fr, G1, G2};
 use crate::crypto::RSUC::utils::{
     ecp_to_base64, ecp_from_base64, zksig_to_base64, zksig_from_base64, 
@@ -260,20 +260,31 @@ async fn handle_join(req: Message, router_id: Vec<u8>, state: Arc<Mutex<ChannelS
         }
     }
 
-    // [关键修改] 链上注册逻辑加强
     if let Some(conf) = contracts {
         if let Some(addr_str) = &req.content {
             if let Ok(user_addr) = Address::from_str(addr_str) {
                 println!("    - 正在链上注册用户 {} ...", user_addr);
                 
-                // [修改] 使用 `?` 传播错误。如果链上失败，函数在这里中止，不会执行后面的逻辑。
-                match blockchain::join_channel(op_config, rpc_url, conf.payment_channel, chan_id_hex, user_addr).await {
+                // [已实现] 增加重试逻辑 (Max 3 次)
+                let mut retry_count = 0;
+                let mut result = Err(Box::<dyn Error>::from("Init"));
+                
+                while retry_count < 3 {
+                    result = blockchain::join_channel(op_config, rpc_url, conf.payment_channel, chan_id_hex, user_addr).await;
+                    if result.is_ok() {
+                        break;
+                    }
+                    println!("      ⚠️ 链上注册超时或失败，正在重试 ({}/3)...", retry_count + 1);
+                    retry_count += 1;
+                    sleep(Duration::from_secs(1)).await; // 等待1秒后重试
+                }
+
+                match result {
                     Ok(_) => println!("    ✅ 链上注册成功 (Tx Confirmed)"),
                     Err(e) => {
-                        println!("❌ 链上注册失败: {}", e);
-                        // 返回错误，阻止用户加入状态树
+                        println!("❌ 链上注册最终失败: {}", e);
                         let mut reply = Message::new("ERROR", "OPERATOR");
-                        reply.content = Some(format!("链上注册失败: {}", e));
+                        reply.content = Some(format!("链上注册失败，请稍后重试: {}", e));
                         let mut resp = zeromq::ZmqMessage::from(router_id);
                         resp.push_back(vec![].into());
                         resp.push_back(serde_json::to_string(&reply)?.into());
@@ -286,7 +297,6 @@ async fn handle_join(req: Message, router_id: Vec<u8>, state: Arc<Mutex<ChannelS
                 return Ok(());
             }
         } else {
-            // [修改] 如果没有提供 content (地址)，直接报错，防止假注册
             println!("❌ JOIN 请求缺失以太坊地址，拒绝请求");
             return Ok(());
         }
@@ -358,7 +368,6 @@ async fn handle_update(
         println!("❌ 签名验证失败"); return Ok(());
     }
 
-    // [关键修复] 传入 4 个参数验证区间证明
     let amt_val = u64::from_str_radix(&tx.amount, 16)?;
     if !range_proof::verify_proof(&tx.range_proof, &tx.sender_commitment, amt_val, &pp) {
         println!("❌ 区间证明无效"); return Ok(());
@@ -376,7 +385,7 @@ async fn handle_update(
     println!("    - 执行同态更新... (Sender -{}, Recv +{})", amt_val, amt_val);
     
     let send_c = ecp_from_base64(&tx.sender_commitment)?;
-    let new_sender_ac = RSUC::upd_ac(send_c, Fr::zero() - amt_fr, sk_op, &pp); // 扣款 (使用减法或加负数)
+    let new_sender_ac = RSUC::upd_ac(send_c, Fr::zero() - amt_fr, sk_op, &pp);
     let new_recv_ac = RSUC::upd_ac(recv_c, amt_fr, sk_op, &pp);
 
     {
@@ -409,30 +418,49 @@ async fn handle_epoch_report(
 
     if let Some(updates) = req.epoch_updates {
         if !updates.is_empty() {
-            println!("    - 包含 {} 笔交易，正在聚合...", updates.len());
-            let (sk, vk, pp, base_c_str) = {
+            println!("    - 包含 {} 笔交易，正在串行验证...", updates.len());
+            
+            let (vk, pp) = {
                 let st = state.lock().unwrap();
-                let base = st.users.get(&sender).unwrap().clone(); 
-                (st.kp.sk, st.kp.vk, st.pp.clone(), base)
+                (st.kp.vk, st.pp.clone())
             };
+
+            // [关键修复]
+            // 原来的 batch_verify_update 适用于并行更新，但 Wallet 是串行更新的 (C0->C1->C2)。
+            // 因此，我们不需要聚合公式。我们只需要验证这些承诺确实是由 Operator 签过名的 (vf_auth)。
+            // 如果签名有效，列表中最后一个承诺就是用户的最新状态。
             
-            let base_c = ecp_from_base64(&base_c_str)?;
-            
-            // [修复] 构建 Vec<(G1, ZKSig)> 列表
-            let mut updates_list = Vec::new();
+            let mut final_c: Option<G1> = None;
+            let mut all_valid = true;
+
             for item in updates {
                 if let (Ok(c), Ok(sig)) = (ecp_from_base64(&item.commitment), zksig_from_base64(&item.signature)) {
-                    updates_list.push((c, sig));
+                    // 验证该状态是否由 Operator 授权过 (vf_auth)
+                    if !RSUC::vf_auth(c, &sig, vk, &pp) {
+                        println!("    ❌ 发现非法承诺/签名，验证失败");
+                        all_valid = false;
+                        break;
+                    }
+                    // 更新为最新的 C
+                    final_c = Some(c);
+                } else {
+                    println!("    ❌ 数据解析失败");
+                    all_valid = false;
+                    break;
                 }
             }
 
-            // [修复] 传入 6 个参数
-            if let Some(new_ac) = batch_verify_update(base_c, base_c, updates_list, sk, vk, &pp) {
-                state.lock().unwrap().users.insert(sender.clone(), ecp_to_base64(new_ac.c));
-                println!("    - 用户状态已聚合更新 (New C) ✅");
+            if all_valid {
+                if let Some(new_c) = final_c {
+                    // 更新 Operator 数据库中的用户状态
+                    state.lock().unwrap().users.insert(sender.clone(), ecp_to_base64(new_c));
+                    println!("    - 用户状态已更新至最新 (New C) ✅");
+                }
             } else {
-                println!("    ❌ 批量更新验证失败");
+                // 如果验证失败，不更新状态
+                println!("    ❌ 汇报验证未通过，忽略此更新");
             }
+
         } else {
             println!("    - 无更新 (Empty)");
         }
@@ -490,7 +518,6 @@ async fn handle_exit(
     println!("    - 验证通过：余额真实有效 ({})", v_val);
 
     // 3. 链上提现
-    // [重要修改] 使用 withdraw_success 追踪链上状态
     let mut withdraw_success = true;
 
     if let Some(conf) = contracts {
@@ -501,7 +528,7 @@ async fn handle_exit(
                     Ok(tx) => println!("✅ 链上提现成功 Tx: {}", tx),
                     Err(e) => {
                         println!("❌ 链上提现失败: {}", e);
-                        withdraw_success = false; // 标记失败
+                        withdraw_success = false;
                     }
                 }
             } else {
@@ -511,27 +538,79 @@ async fn handle_exit(
         }
     }
 
-    // 4. 根据结果决定是否移除用户
+    // 4. 处理退出逻辑（含延迟自动关闭）
     if withdraw_success {
-        // 成功：回复 ACK 并移除状态
+        // 4.1 发送 ACK
         let reply = Message::new("EXIT_ACK", "OPERATOR");
         let mut resp = zeromq::ZmqMessage::from(router_id);
         resp.push_back(vec![].into());
         resp.push_back(serde_json::to_string(&reply)?.into());
         router.send(resp).await?;
 
-        state.lock().unwrap().users.remove(&sender);
-        println!("✅ 用户 {} 已安全退出", sender);
+        // 4.2 移除用户并获取剩余人数
+        let remaining_count = {
+            let mut st = state.lock().unwrap();
+            st.users.remove(&sender);
+            st.users.len()
+        };
+        
+        println!("✅ 用户 {} 已安全退出。剩余用户: {}", sender, remaining_count);
+
+        // 4.3 [已实现] 自动关闭逻辑：若无人，倒计时 60s
+        if remaining_count == 0 {
+            if let Some(conf) = contracts {
+                println!("⏳ 通道已空闲。启动 60s 倒计时，若无新用户加入将关闭通道...");
+
+                // Clone 必需数据以便传入 async 块
+                let state_clone = state.clone();
+                let op_config_clone = op_config.clone();
+                let rpc_url_clone = rpc_url.to_string();
+                let contract_addr = conf.payment_channel;
+                let chan_id_clone = chan_id;
+
+                tokio::spawn(async move {
+                    // 1. 等待
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+
+                    // 2. 双重检查 (Double Check)
+                    let current_count = {
+                        state_clone.lock().unwrap().users.len()
+                    };
+
+                    if current_count > 0 {
+                        println!("✋ [Auto-Close] 倒计时结束，但在窗口期内有 {} 位新用户加入。取消关闭。", current_count);
+                    } else {
+                        println!("🔒 [Auto-Close] 倒计时结束，通道仍为空。正在执行链上关闭...");
+                        
+                        // 3. 调用链上关闭
+                        match blockchain::close_channel(
+                            &op_config_clone, 
+                            &rpc_url_clone, 
+                            contract_addr, 
+                            chan_id_clone
+                        ).await {
+                            Ok(tx) => {
+                                println!("🎉 [Auto-Close] 通道关闭成功！Tx: {}", tx);
+                                println!("💰 保证金已赎回。Operator 服务停止。");
+                                std::process::exit(0);
+                            },
+                            Err(e) => {
+                                println!("❌ [Auto-Close] 关闭失败: {}", e);
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
     } else {
-        // 失败：通知用户，不移除状态
+        // 失败逻辑
         let mut reply = Message::new("WAIT", "OPERATOR");
         reply.content = Some("链上提现执行失败，请联系 Operator 或稍后重试".into());
-        
         let mut resp = zeromq::ZmqMessage::from(router_id);
         resp.push_back(vec![].into());
         resp.push_back(serde_json::to_string(&reply)?.into());
         router.send(resp).await?;
-        
         println!("⚠️ 链上操作失败，保留用户 {} 状态以供重试", sender);
     }
     

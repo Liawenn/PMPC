@@ -70,9 +70,8 @@ pub async fn run(
     // 1. 初始化共享状态
     let wallet = Arc::new(Mutex::new(UserWallet::new(initial_deposit.unwrap_or(0))));
     
-    // [关键修复] pp 必须是共享状态，且在 spawn 之前定义
+    // pp 必须是共享状态
     let pp_shared = Arc::new(Mutex::new(None::<PP>));
-    // 缓存的其他状态也建议共享，以免闭包捕获问题
     let cached_vk_shared = Arc::new(Mutex::new(None::<G2>)); 
     let channel_id_shared = Arc::new(Mutex::new(None::<String>));
 
@@ -127,16 +126,11 @@ pub async fn run(
                                         
                                         let mut wallet_lock = w.lock().unwrap();
                                         
-                                        // [修复] 获取共享的 PP
                                         let pp_guard = pp_lock.lock().unwrap();
                                         if let Some(ref pp_ref) = *pp_guard {
-                                            // 调用 buffer_incoming_update 并传入 pp
                                             wallet_lock.buffer_incoming_update(new_ac, U256::from(amt), pp_ref);
-                                            
                                             println!("💰 收款暂存! Pending: {} wei (主余额: {})", wallet_lock.current_epoch_income, wallet_lock.amount);
                                         } else {
-                                            // 如果还没 Join，没有 PP，无法去随机化，只能暂存或报错
-                                            // 这里为了不崩，可以只打印警告
                                             println!("⚠️ 警告: 收到转账但尚未 Join (无PP)，无法去随机化/存入");
                                         }
                                         
@@ -193,7 +187,6 @@ pub async fn run(
                                             let g2 = G2::from_hex(&hex::encode(g2_b)).unwrap_or(G2::generator());
                                             let vk = G2::from_hex(&hex::encode(vk_b)).unwrap_or(G2::generator());
                                             
-                                            // [关键修复] 更新共享状态
                                             *pp_guard = Some(PP { g1, p, g2 });
                                             *vk_guard = Some(vk);
                                             println!("[INFO] RSUC 参数加载成功");
@@ -220,8 +213,6 @@ pub async fn run(
                             req.channel_id = Some(ch_id.to_string());
                             req.amount = Some(format!("{:x}", cur_amt)); 
                             req.vk = Some(ecp_to_base64(pk)); 
-                            
-                            // [✅ 修复点] 必须将 content 设置为当前用户的以太坊地址
                             req.content = Some(me.address.to_string());
 
                             let mut z = zeromq::ZmqMessage::from(vec![]);
@@ -238,6 +229,13 @@ pub async fn run(
                                 
                                 let pp_guard = pp_shared.lock().unwrap();
                                 if let Some(pp_ref) = pp_guard.as_ref() {
+                                    // 检查是否已 Join
+                                    if w.base.is_none() {
+                                        println!("❌ 错误: 您尚未成功加入通道 (未收到 Operator 确认)。");
+                                        drop(w); drop(pp_guard);
+                                        print_prompt(&me.name); continue;
+                                    }
+
                                     w.prepare_reception_for_sharing(pp_ref);
                                     let recv_state = w.reception.as_ref().unwrap();
                                     let mut m = Message::new("EXCHANGE_INFO", &me.name);
@@ -276,7 +274,6 @@ pub async fn run(
                             }
                             let remaining = (w.pending_amount - amt_u256).to::<u64>(); 
                             
-                            // [修改] 使用共享的 PP
                             let pp_guard = pp_shared.lock().unwrap();
                             let pp_ref = pp_guard.as_ref().unwrap(); 
                             let base_r = w.base.as_ref().unwrap().r;
@@ -306,7 +303,7 @@ pub async fn run(
                             
                             let sk = w.schnorr_sk.unwrap(); 
                             let sig = schnorr::sign(&tx_json, sk, pp_ref.g1);
-                            drop(pp_guard); // 释放
+                            drop(pp_guard);
 
                             let cid_guard = channel_id_shared.lock().unwrap();
                             let mut req = Message::new("UPDATE_REQ", &me.name);
@@ -436,10 +433,7 @@ pub async fn run(
                             } else if resp.r#type == "EPOCH_ACK" {
                                 println!("\n✅ [EPOCH] 收到 Operator 确认，结算完成！");
                                 wallet.lock().unwrap().settle_epoch();
-                                
-                                // [UX 优化] 提示用户可以退出
                                 println!("✅ [提示] 本轮结算完毕，您现在可以安全执行 exit 提现，或继续进行下一轮交易。");
-
                                 print_prompt(&me.name);
 
                             } else if resp.r#type == "EXIT_ACK" {
@@ -449,6 +443,15 @@ pub async fn run(
                             
                             } else if resp.r#type == "WAIT" {
                                 println!("\n⏳ 请求已挂起：Operator 正在结算中...");
+                                print_prompt(&me.name);
+                                
+                            // [新增修复] 处理错误消息
+                            } else if resp.r#type == "ERROR" {
+                                println!("\n❌ [服务端错误] {}", resp.content.unwrap_or("未知错误".into()));
+                                println!("💡 建议：请检查网络连接或稍后重试 'join' 命令");
+                                
+                                // 重置 Channel ID，允许重试
+                                *channel_id_shared.lock().unwrap() = None;
                                 print_prompt(&me.name);
                             }
                         }
@@ -461,6 +464,16 @@ pub async fn run(
                     if let Some(payload) = m.iter().last() {
                         let json = String::from_utf8_lossy(payload);
                         if let Ok(msg) = serde_json::from_str::<Message>(&json) {
+                            
+                            // [新增修复] 状态过滤：如果本地钱包还没初始化(base是None)，直接忽略广播
+                            let is_joined = {
+                                wallet.lock().unwrap().base.is_some()
+                            };
+
+                            if !is_joined {
+                                continue; 
+                            }
+
                             if msg.r#type == "CHANNEL_STATE" {
                                 println!("\n\n📢 [{}] 收到通道更新广播", me.name);
                                 if let Some(content) = msg.commitment {
