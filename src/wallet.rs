@@ -1,4 +1,6 @@
-use crate::crypto::RSUC::{self, AuthCommitment, PP, rdm_ac, upd_ac, unrandomize}; // [新增] unrandomize
+// 文件: wallet.rs
+
+use crate::crypto::RSUC::{self, AuthCommitment, PP, rdm_ac, upd_ac, unrandomize};
 use crate::crypto::RSUC::wrapper::{Fr, G1, G2};
 use crate::crypto::RSUC::utils::{ecp_to_base64, zksig_to_base64};
 use crate::models::EpochUpdateItem;
@@ -25,26 +27,23 @@ impl WalletReceptionState {
         let new_ac = rdm_ac(base.ac.c, &base.ac.sigma, r_delta, pp);
         (Self { ac: new_ac, r: base.r, r_delta }, r_delta)
     }
-
-    pub fn rerandomize(&self, pp: &PP) -> (Self, Fr) {
-        let r_delta = Fr::random();
-        let new_ac = rdm_ac(self.ac.c, &self.ac.sigma, r_delta, pp);
-        (Self { ac: new_ac, r: self.r, r_delta }, r_delta)
-    }
 }
 
 #[derive(Clone, Debug)]
 pub struct UserWallet {
-    pub amount: U256,         // 已结算的主余额
-    pub pending_amount: U256, // 扣除发送后的临时余额 (amount - spent)
-    
-    // [修复] 新增字段：本轮累计接收收入 (received)
+    pub amount: U256,         
+    pub pending_amount: U256, 
     pub current_epoch_income: U256, 
-    // [修复] 新增字段：Epoch 暂存区
-    pub epoch_buffer: Vec<EpochUpdateItem>,
+    pub epoch_buffer: Vec<EpochUpdateItem>, 
 
+    // [当前动态 Base] 用于发送交易，随 Send 变化
     pub base: Option<WalletBaseState>,
-    pub reception: Option<WalletReceptionState>,
+    
+    // [新增: 本轮初始 Base] 专门用于生成接收地址和结算汇报，本轮内**恒定不变**
+    pub epoch_base: Option<WalletBaseState>,
+
+    pub active_receptions: HashMap<String, Fr>, 
+    
     pub schnorr_sk: Option<Fr>,
     pub schnorr_pk: Option<G1>,
     pub peer_receptions: HashMap<String, AuthCommitment>,
@@ -56,10 +55,11 @@ impl UserWallet {
         Self {
             amount: amt,
             pending_amount: amt,
-            current_epoch_income: U256::ZERO, // [修复] 初始化
-            epoch_buffer: Vec::new(),         // [修复] 初始化
+            current_epoch_income: U256::ZERO,
+            epoch_buffer: Vec::new(),
             base: None,
-            reception: None,
+            epoch_base: None, // 初始化为 None
+            active_receptions: HashMap::new(),
             schnorr_sk: None,
             schnorr_pk: None,
             peer_receptions: HashMap::new(),
@@ -76,89 +76,117 @@ impl UserWallet {
 
     pub fn init_from_operator(&mut self, ac: AuthCommitment, r: Fr, _pp: &PP) {
         println!("  [Wallet] 正在初始化本地钱包状态...");
-        let base = WalletBaseState { ac, r };
-        // 初始不生成 reception，等 share_addr 再生成
-        self.base = Some(base);
-        self.reception = None; 
+        let base_state = WalletBaseState { ac, r };
+        self.base = Some(base_state.clone());
+        self.epoch_base = Some(base_state); // 初始化时，两者相同
+        self.active_receptions.clear();
         println!("  [Wallet] 状态初始化完成！(Base Ready)");
     }
 
-    // 仅在 share_addr 时调用
-    pub fn prepare_reception_for_sharing(&mut self, pp: &PP) -> Fr {
-        if let Some(ref base) = self.base {
-            // 基于 Base 生成新的 Reception
+    pub fn prepare_reception_for_sharing(&mut self, pp: &PP) -> AuthCommitment {
+        // [关键] 生成接收地址时，必须基于 epoch_base (本轮初始状态)
+        if let Some(ref base) = self.epoch_base {
             let (new_recv, r_delta) = WalletReceptionState::from_base(base, pp);
-            self.reception = Some(new_recv);
-            println!("  [Wallet] 接收地址已重随机化 (New r_delta)");
-            r_delta
+            let c_str = ecp_to_base64(new_recv.ac.c);
+            self.active_receptions.insert(c_str, r_delta);
+            println!("  [Wallet] 接收地址已生成并缓存 (r_delta saved)");
+            new_recv.ac 
         } else {
-            Fr::zero()
+            panic!("Wallet not initialized (Join first)");
         }
     }
 
-    // [发送方] 更新本地 Base 和 Pending 余额
     pub fn apply_update_as_sender(&mut self, new_ac: AuthCommitment, new_total: U256, _pp: &PP) {
         self.pending_amount = new_total; 
         if let Some(ref mut base) = self.base {
             base.ac = new_ac; 
+            // [注意] 这里只更新 self.base (用于下次发送)，绝对不更新 self.epoch_base
         }
-        // Base 变了，旧 Reception 失效，清空以强制下次 share_addr 重新生成
-        self.reception = None; 
         println!("  [Wallet] (发送方) 本地状态已更新，余额: {} wei", self.pending_amount);
     }
 
-    // [接收方] 收到 P2P 转账 -> 去随机化 -> 存入 Buffer
     pub fn buffer_incoming_update(&mut self, randomized_ac: AuthCommitment, amt: U256, pp: &PP) {
         println!("  [Wallet] 收到转账，正在处理...");
         
-        // 1. 尝试获取去随机化所需的 r_delta
-        // 如果 reception 为空 (没 share 过)，这里会 panic 或失败。
-        // 正常流程是：share_addr -> 对方 send -> 我收到。所以 reception 应该有值。
-        if let Some(ref recv) = self.reception {
-            let r_delta = recv.r_delta;
-            
-            // 2. 去随机化
-            let canonical_ac = unrandomize(randomized_ac.c, &randomized_ac.sigma, r_delta, pp);
-            
-            // 3. 存入 Buffer
+        if self.epoch_base.is_none() {
+            println!("  ⚠️ [Error] 钱包未初始化");
+            return;
+        }
+
+        let amt_u64 = amt.to::<u64>(); 
+        
+        // [关键] 验证是基于 epoch_base 进行的
+        let expected_c = self.epoch_base.as_ref().unwrap().ac.c + (pp.g1 * Fr::from_u64(amt_u64));
+        let mut found_r_delta = None;
+
+        for (_key, &r_delta) in &self.active_receptions {
+            let candidate_ac = unrandomize(randomized_ac.c, &randomized_ac.sigma, r_delta, pp);
+            if ecp_to_base64(candidate_ac.c) == ecp_to_base64(expected_c) {
+                found_r_delta = Some((r_delta, candidate_ac));
+                break;
+            }
+        }
+
+        if let Some((_r_delta, canonical_ac)) = found_r_delta {
+            // [关键] 汇报时，填入 epoch_base 的承诺
+            let epoch_base_c = self.epoch_base.as_ref().unwrap().ac.c;
+
             let item = EpochUpdateItem {
                 commitment: ecp_to_base64(canonical_ac.c),
                 signature: zksig_to_base64(&canonical_ac.sigma),
                 amount_hex: format!("{:x}", amt),
+                base_commitment: ecp_to_base64(epoch_base_c), // 使用恒定的 Epoch Base
             };
             self.epoch_buffer.push(item);
             
-            // 4. 更新累计收入 (仅记录，不进 pending_amount，防止双重消费)
             self.current_epoch_income += amt;
             
-            // 5. 更新 Base (为了支持连续接收)
-            // 假设下一次接收基于这次的结果
-            if let Some(ref mut base) = self.base {
-                base.ac = canonical_ac;
-            }
-            
-            println!("  [Wallet] 交易存入 Epoch Buffer。本轮暂收: +{} wei", self.current_epoch_income);
+            println!("  [Wallet] 去随机化成功！存入 Buffer。本轮暂收: +{} wei", self.current_epoch_income);
         } else {
-            println!("  ⚠️ [Error] 无法去随机化：本地 Reception 状态缺失");
+            println!("  ⚠️ [Error] 无法去随机化：未找到匹配的接收地址");
         }
     }
 
-    // [结算] 收到 EPOCH_ACK
-    pub fn settle_epoch(&mut self) {
+    pub fn settle_epoch(&mut self, remote_update: Option<AuthCommitment>) {
         println!("  [Wallet] --- 执行 Epoch 结算 ---");
-        println!("  [Wallet] 初始主余额: {}", self.amount);
-        println!("  [Wallet] 本轮发送扣除: -{}", self.amount - self.pending_amount); // 假设 pending <= amount
-        println!("  [Wallet] 本轮接收收入: +{}", self.current_epoch_income);
         
-        // 新余额 = (扣除后的 Pending) + (本轮收入)
+        let old_bal = self.amount;
         self.amount = self.pending_amount + self.current_epoch_income;
-        
-        // 重置状态
-        self.pending_amount = self.amount;
+        self.pending_amount = self.amount; 
+
+        println!("  [Wallet] 余额更新: {} -> {} wei", old_bal, self.amount);
+
+        if let Some(ref old_epoch_base) = self.epoch_base {
+            // 随机数 r 在本轮内始终未变
+            let new_r = old_epoch_base.r; 
+            
+            if let Some(new_ac) = remote_update {
+                let new_state = WalletBaseState {
+                    ac: new_ac,
+                    r: new_r
+                };
+                // [关键] 结算后，更新 Base 和 Epoch Base 为最新状态
+                self.base = Some(new_state.clone());
+                self.epoch_base = Some(new_state);
+                println!("  [Wallet] ✅ 状态凭证已更新 (Signature updated)");
+            } else {
+                 if self.current_epoch_income > U256::ZERO {
+                     println!("  ⚠️ [Warning] 有收入但未收到 Operator 凭证!");
+                 }
+                 // 无更新时，同步状态
+                 if let Some(current_base) = &self.base {
+                     self.epoch_base = Some(current_base.clone());
+                 }
+                 println!("  [Wallet] 状态同步完成 (无接收更新)");
+            }
+        } else {
+             println!("  ⚠️ [Error] Base丢失，无法结算");
+        }
+
         self.current_epoch_income = U256::ZERO;
-        let count = self.epoch_buffer.len();
         self.epoch_buffer.clear();
+        self.active_receptions.clear();
         
-        println!("  [Wallet] 结算完成！最新余额: {} wei (归档 {} 笔接收)", self.amount, count);
+        println!("  [Wallet] 结算完成！");
     }
 }

@@ -1,5 +1,6 @@
+// 文件: models.rs
+
 use serde::{Deserialize, Serialize};
-// [修复] 删除了 use crate::models::EpochUpdateItem; 这一行
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message {
@@ -50,7 +51,6 @@ impl Message {
     }
 }
 
-// 交易结构体
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TransactionTx {
     pub sender_commitment: String,
@@ -63,10 +63,11 @@ pub struct TransactionTx {
     pub timestamp: u64,
 }
 
-// Epoch 汇报条目
+// [重要] 必须加上 base_commitment 字段
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EpochUpdateItem {
     pub commitment: String, 
     pub signature: String,  
     pub amount_hex: String,
+    pub base_commitment: String, // <--- 加上这一行！
 }

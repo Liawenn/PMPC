@@ -278,11 +278,11 @@ pub fn unrandomize(c_new: G1, sigma_new: &ZKSig, r_prime: Fr, pp: &PP) -> AuthCo
 
 // 批量更新: C* = Sum(Ci) + C_sender - k * C_base
 pub fn batch_verify_update(
-    base_c: G1, 
-    sender_c: G1,             // 发送方最新承诺 (Operator存储)
-    updates: Vec<(G1, ZKSig)>, // 接收方承诺列表 (待验证)
+    sender_c: G1,             // [修复] 第一个参数是 Sender 当前状态 (Operator最新存储)
+    base_c: G1,               // [修复] 第二个参数是 Base 状态 (接收交易的基准)
+    updates: Vec<(G1, ZKSig)>, 
     sk: Fr, 
-    vk: G2,                   // Operator公钥 (用于验证用户提交的更新)
+    vk: G2,                   
     pp: &PP
 ) -> Option<AuthCommitment> {
     println!("[RSUC] 正在执行 Batch Update (聚合更新 + 验证)...");
@@ -290,7 +290,7 @@ pub fn batch_verify_update(
     let k = updates.len();
     
     // 1. 验证所有接收方更新的合法性
-    let mut c_sum = sender_c; // 初始值设为 C_sender (因为公式里是加法)
+    let mut c_sum = sender_c; // 初始值设为 C_sender
 
     for (c, sig) in updates {
         // 对每一笔收到的款项，Operator 必须验证其签名有效性
@@ -305,12 +305,11 @@ pub fn batch_verify_update(
     let mut c_star = c_sum;
     if k > 0 {
         let k_fr = Fr::from_u64(k as u64);
-        let k_base = base_c * k_fr;
+        let k_base = base_c * k_fr; // 这里的 base_c 现在正确对应了基准承诺
         c_star = c_star - k_base;
     }
 
     // 3. 生成新签名
-    // 这里的签名是针对 C* 的，证明 Operator 认可这个新的聚合状态
     Some(auth_com_from_c(c_star, sk, pp))
 }
 
@@ -324,7 +323,7 @@ fn auth_com_from_c(c: G1, x: Fr, pp: &PP) -> AuthCommitment {
 }
 
 // ==========================================
-// 工具函数
+// 工具函数 (保持不变)
 // ==========================================
 pub mod utils {
     use super::wrapper::*;
