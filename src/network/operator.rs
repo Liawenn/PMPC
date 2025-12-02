@@ -24,7 +24,10 @@ enum OpStatus {
     Settling,   
 }
 
-struct ChannelState {
+// [修改] 增加 ID 字段，使 State 自包含通道信息
+pub struct ChannelState {
+    pub channel_id_str: String,
+    pub channel_id_bytes: FixedBytes<32>,
     pp: PP,
     kp: KeyPair,
     users: HashMap<String, String>, 
@@ -34,45 +37,147 @@ struct ChannelState {
     pending_joins: Vec<(Message, Vec<u8>)>, 
 }
 
-pub async fn run(
-    op_config: ActorConfig, 
-    rpc_url: String, 
-    contracts: Option<ContractsConfig>,
-    initial_deposit: Option<u128>
+// ==========================================
+// 阶段 0: 资金预存 (Fund Operator)
+// ==========================================
+pub async fn fund_operator(
+    op_config: &ActorConfig, 
+    rpc_url: &str, 
+    contracts: &ContractsConfig,
+    amount_wei: u128
 ) -> Result<(), Box<dyn Error>> {
-    println!("\n==== OPERATOR 启动序列 ====");
-    println!("👤 身份: {}", op_config.name);
+    println!("\n==== [Phase 0] 资金预存 (Fund Operator) ====");
+    println!("👤 Operator: {}", op_config.name);
+    println!("💰 正在向合约充值: {} wei...", amount_wei);
+    
+    // 仅执行锁仓，不创建通道
+    blockchain::lock_deposit(op_config, rpc_url, contracts.payment_channel, amount_wei).await?;
+    
+    println!("✅ 资金锁定成功！Operator 余额已增加。");
+    Ok(())
+}
 
-    let mut channel_id_str = String::new();
-    let mut channel_id_bytes = FixedBytes::<32>::ZERO;
+// ==========================================
+// 阶段 1: 创建通道 (Create Channel) - 极速
+// ==========================================
+pub async fn create_channel(
+    op_config: &ActorConfig, 
+    rpc_url: &str, 
+    contracts: &ContractsConfig
+) -> Result<(String, FixedBytes<32>), Box<dyn Error>> {
+    println!("\n==== [Phase 1] 创建通道 (Create Channel) ====");
+    
+    // 1. 生成 ID
+    let uuid = Uuid::new_v4();
+    let channel_id_str = format!("ch-{}", &uuid.to_string()[0..8]);
+    let channel_id_bytes = keccak256(channel_id_str.as_bytes());
+    
+    println!("🆔 拟定 Channel ID: {}", channel_id_str);
+    println!("    Hex: {}", channel_id_bytes);
 
-    // 1. 链上操作
-    if let Some(conf) = &contracts {
-        let amount = initial_deposit.unwrap_or(20);
-        println!("[2] 正在锁仓 {} wei...", amount);
-        let _ = blockchain::lock_deposit(&op_config, &rpc_url, conf.payment_channel, amount).await;
+    // 2. 调用合约 createChannel (前提：Phase 0 已执行，合约内有余额)
+    println!("🔗 正在链上注册通道...");
+    let t = std::time::Instant::now();
+    
+    // 这里不再调用 lock_deposit，直接利用 Phase 0 充值的余额
+    let tx_hash = blockchain::create_channel(
+        op_config, 
+        rpc_url, 
+        contracts.payment_channel, 
+        channel_id_bytes
+    ).await?;
+    
+    println!("✅ 通道注册成功! Tx: {}", tx_hash);
+    println!("⏱️ 耗时: {:?}", t.elapsed());
 
-        let uuid = Uuid::new_v4();
-        channel_id_str = format!("ch-{}", &uuid.to_string()[0..8]);
-        channel_id_bytes = keccak256(channel_id_str.as_bytes());
+    Ok((channel_id_str, channel_id_bytes))
+}
 
-        println!("[1] 通道已生成: {}", channel_id_str);
-        println!("    Hex ID: {}", channel_id_bytes);
+// ==========================================
+// 阶段 2: 初始化参数 (Init Channel) - 耗时
+// ==========================================
+// operator.rs
 
-        println!("[3] 正在链上注册通道...");
-        let t = std::time::Instant::now();
-        let _ = blockchain::create_channel(&op_config, &rpc_url, conf.payment_channel, channel_id_bytes).await;
-        println!("{:?}", t.elapsed());
-    }
-
-    // 2. RSUC 初始化
-    println!("[4] 初始化 RSUC 参数...");
+pub async fn init_channel(
+    op_config: &ActorConfig,
+    rpc_url: &str,
+    contracts: &ContractsConfig,
+    channel_id_str: String,
+    channel_id_bytes: FixedBytes<32>
+) -> Result<Arc<Mutex<ChannelState>>, Box<dyn Error>> {
+    println!("\n==== [Phase 2] 初始化参数 (Init Channel) ====");
+    
+    // 1. RSUC 密码学参数生成 (CPU 密集，依然很快)
+    println!("⚙️ [Init] 正在生成 RSUC 公共参数 (KeyGen)...");
+    let t_calc = std::time::Instant::now();
     let pp = RSUC::setup();
     let kp = RSUC::key_gen(&pp);
+    println!("   ✅ 参数生成完毕，耗时: {:?}", t_calc.elapsed());
+
+    // =========================================================
+    // [新增] 2. 等待通道在链上确认 (Spinlock)
+    // =========================================================
+    println!("⏳ [Init] 正在等待链上通道确认 (等待出块)...");
+    let mut retries = 0;
+    loop {
+        // 调用 blockchain.rs 中新增的 check_channel_ready
+        let is_ready = blockchain::check_channel_ready(
+            rpc_url, 
+            contracts.payment_channel, 
+            channel_id_bytes
+        ).await?;
+
+        if is_ready {
+            println!("   ✅ 通道已确认上链！(Retries: {})", retries);
+            break;
+        }
+
+        retries += 1;
+        if retries % 5 == 0 {
+            print!("."); // 每5秒打印一个点
+            use std::io::Write;
+            std::io::stdout().flush().unwrap();
+        }
+        
+        // 等待 1 秒再查
+        sleep(Duration::from_secs(1)).await;
+        
+        // 可选：设置超时（例如 60秒）
+        if retries > 60 {
+            return Err("❌ 通道创建超时，请检查 Operator 余额或网络状态".into());
+        }
+    }
+    println!(""); // 换行
+
+    // 3. 准备上传的数据
+    let g1_bytes = hex::decode(pp.g1.to_hex())?;
+    let p_bytes  = hex::decode(pp.p.to_hex())?;
+    let g2_bytes = hex::decode(pp.g2.to_hex())?;
+    let vk_bytes = hex::decode(kp.vk.to_hex())?;
+    let ord_bytes = vec![]; 
+
+    // 4. 调用合约 setupRSUC (现在肯定能成功了)
+    println!("📡 [Init] 正在上传参数到链上 (setupRSUC)...");
+    let t_upload = std::time::Instant::now();
     
+    // 这里可能会因为网络波动失败，建议也可以加个重试，但通常这里已经稳了
+    let tx_hash = blockchain::setup_rsuc(
+        op_config, 
+        rpc_url, 
+        contracts.payment_channel, 
+        channel_id_bytes, 
+        g1_bytes, p_bytes, g2_bytes, ord_bytes, vk_bytes
+    ).await?;
+    
+    println!("   ✅ 参数上传成功! Tx: {}", tx_hash);
+    println!("   ⏱️ 上传耗时: {:?}", t_upload.elapsed());
+
+    // 5. 构建并返回共享状态
     let state = Arc::new(Mutex::new(ChannelState {
-        pp: pp.clone(),
-        kp: kp.clone(),
+        channel_id_str,
+        channel_id_bytes,
+        pp,
+        kp,
         users: HashMap::new(),
         schnorr_keys: HashMap::new(),
         status: OpStatus::Running,
@@ -80,59 +185,66 @@ pub async fn run(
         pending_joins: Vec::new(),
     }));
 
-    // 3. 上传参数
-    if let Some(conf) = &contracts {
-        println!("[5] 上传参数到合约...");
-        let g1_bytes = hex::decode(pp.g1.to_hex())?;
-        let p_bytes  = hex::decode(pp.p.to_hex())?;
-        let g2_bytes = hex::decode(pp.g2.to_hex())?;
-        let vk_bytes = hex::decode(kp.vk.to_hex())?;
-        let ord_bytes = vec![]; 
+    Ok(state)
+}
 
-        println!("    >>> [Debug] Uploading G1: {}...", &hex::encode(&g1_bytes)[0..10]);
-        let _ = blockchain::setup_rsuc(
-            &op_config, &rpc_url, conf.payment_channel, channel_id_bytes, 
-            g1_bytes, p_bytes, g2_bytes, ord_bytes, vk_bytes
-        ).await;
-    }
+// ==========================================
+// 阶段 3: 运行节点 (Run Node) - 循环
+// ==========================================
+pub async fn run_node(
+    state: Arc<Mutex<ChannelState>>,
+    op_config: ActorConfig, 
+    rpc_url: String, 
+    contracts: Option<ContractsConfig>
+) -> Result<(), Box<dyn Error>> {
+    println!("\n==== [Phase 3] 启动节点服务 (Run Node) ====");
+    
+    // 从 State 中提取 ID 信息用于日志和逻辑
+    let (chan_id_str, chan_id_bytes) = {
+        let st = state.lock().unwrap();
+        (st.channel_id_str.clone(), st.channel_id_bytes)
+    };
+    
+    println!("🚀 服务启动 | Channel: {}", chan_id_str);
 
-    // 4. ZMQ 绑定
-    println!("[6] 监听端口: 5555 (Router), 5556 (Pub)");
+    // 1. ZMQ 绑定
+    println!("📡 监听端口: 5555 (Router), 5556 (Pub)");
     let mut router = zeromq::RouterSocket::new();
     router.bind("tcp://0.0.0.0:5555").await?;
     let mut pub_sock = zeromq::PubSocket::new();
     pub_sock.bind("tcp://0.0.0.0:5556").await?;
 
-    println!("\nOperator 就绪. 等待初始用户加入 (100s)...");
+    println!("⏳ 等待初始用户加入 (100s)...");
     
     let init_deadline = sleep(Duration::from_secs(100)); 
     tokio::pin!(init_deadline);
 
+    // 2. 初始化窗口循环
     loop {
         tokio::select! {
             _ = &mut init_deadline => {
-                println!("⏰ 初始化窗口结束，正式开启 Epoch 1 (100s)...");
+                println!("⏰ 初始化窗口结束，正式开启 Epoch 1...");
                 
                 let st = state.lock().unwrap();
                 let user_list: Vec<String> = st.users.iter().map(|(u, c)| format!("{}:{}", u, c)).collect();
                 let payload = user_list.join(";");
                 drop(st); 
 
-                broadcast_msg("CHANNEL_STATE", None, Some(payload), &mut pub_sock, channel_id_bytes).await;
+                broadcast_msg("CHANNEL_STATE", None, Some(payload), &mut pub_sock, chan_id_bytes).await;
                 println!("    [广播] 初始通道状态已推送");
 
-                broadcast_msg("EPOCH_START_SIGNAL", Some(1), None, &mut pub_sock, channel_id_bytes).await;
-                
+                broadcast_msg("EPOCH_START_SIGNAL", Some(1), None, &mut pub_sock, chan_id_bytes).await;
                 break; 
             }
             msg = router.recv() => {
                 if let Ok(msg) = msg {
-                    process_msg(msg, state.clone(), &mut router, &mut pub_sock, channel_id_str.clone(), channel_id_bytes, true, &op_config, &rpc_url, &contracts).await?;
+                    process_msg(msg, state.clone(), &mut router, &mut pub_sock, chan_id_str.clone(), chan_id_bytes, true, &op_config, &rpc_url, &contracts).await?;
                 }
             }
         }
     }
 
+    // 3. 正式 Epoch 循环
     let mut epoch_timer = interval(Duration::from_secs(100));
     epoch_timer.tick().await; 
 
@@ -144,10 +256,9 @@ pub async fn run(
                     OpStatus::Running => {
                         println!("\n⏰ [Timer] Epoch {} 结束，进入结算阶段 (Settling)...", st.epoch_round);
                         st.status = OpStatus::Settling;
-                        
                         let round = st.epoch_round;
                         drop(st); 
-                        broadcast_msg("EPOCH_END_SIGNAL", Some(round), None, &mut pub_sock, channel_id_bytes).await;
+                        broadcast_msg("EPOCH_END_SIGNAL", Some(round), None, &mut pub_sock, chan_id_bytes).await;
                     },
                     OpStatus::Settling => {
                         let next_round = st.epoch_round + 1;
@@ -159,7 +270,7 @@ pub async fn run(
                         if !pending.is_empty() {
                             println!("    ! 恢复处理 {} 个挂起的 Join 请求...", pending.len());
                             for (req, rid) in pending {
-                                handle_join(req, rid, state.clone(), &mut router, &mut pub_sock, channel_id_str.clone(), channel_id_bytes, &op_config, &rpc_url, &contracts).await?;
+                                handle_join(req, rid, state.clone(), &mut router, &mut pub_sock, chan_id_str.clone(), chan_id_bytes, &op_config, &rpc_url, &contracts).await?;
                             }
                         }
 
@@ -171,20 +282,24 @@ pub async fn run(
                         let payload = user_list.join(";");
                         drop(st);
 
-                        broadcast_msg("CHANNEL_STATE", None, Some(payload), &mut pub_sock, channel_id_bytes).await;
-                        broadcast_msg("EPOCH_START_SIGNAL", Some(next_round), None, &mut pub_sock, channel_id_bytes).await;
+                        broadcast_msg("CHANNEL_STATE", None, Some(payload), &mut pub_sock, chan_id_bytes).await;
+                        broadcast_msg("EPOCH_START_SIGNAL", Some(next_round), None, &mut pub_sock, chan_id_bytes).await;
                     }
                 }
             }
 
             msg = router.recv() => {
                 if let Ok(msg) = msg {
-                    process_msg(msg, state.clone(), &mut router, &mut pub_sock, channel_id_str.clone(), channel_id_bytes, false, &op_config, &rpc_url, &contracts).await?;
+                    process_msg(msg, state.clone(), &mut router, &mut pub_sock, chan_id_str.clone(), chan_id_bytes, false, &op_config, &rpc_url, &contracts).await?;
                 }
             }
         }
     }
 }
+
+// ==========================================
+// 辅助函数 (Helpers)
+// ==========================================
 
 async fn broadcast_msg(type_: &str, round: Option<u64>, content: Option<String>, pub_sock: &mut zeromq::PubSocket, topic_bytes: FixedBytes<32>) {
     let mut msg = Message::new(type_, "OPERATOR");
@@ -252,7 +367,7 @@ async fn process_msg(
     Ok(())
 }
 
-async fn handle_join(req: Message, router_id: Vec<u8>, state: Arc<Mutex<ChannelState>>, router: &mut zeromq::RouterSocket, pub_sock: &mut zeromq::PubSocket, chan_id_alias: String, chan_id_hex: FixedBytes<32>, op_config: &ActorConfig, rpc_url: &str, contracts: &Option<ContractsConfig>) -> Result<(), Box<dyn Error>> {
+async fn handle_join(req: Message, router_id: Vec<u8>, state: Arc<Mutex<ChannelState>>, router: &mut zeromq::RouterSocket, _pub_sock: &mut zeromq::PubSocket, chan_id_alias: String, chan_id_hex: FixedBytes<32>, op_config: &ActorConfig, rpc_url: &str, contracts: &Option<ContractsConfig>) -> Result<(), Box<dyn Error>> {
     let sender = req.sender.clone();
     println!(">>> [JOIN] 处理请求: {}", sender);
 
@@ -440,8 +555,6 @@ async fn handle_epoch_report(
             println!("    - 包含 {} 笔交易，正在批量验证...", updates.len());
             
             // [关键修改] 3. 解析 base_commitment
-            // 我们假设一个 epoch 内所有的接收都是基于同一个 base 的 (设计要求)
-            // 所以直接取 updates[0] 的 base 即可
             let base_c_str = &updates[0].base_commitment;
             let epoch_base_c = match ecp_from_base64(base_c_str) {
                 Ok(c) => c,
@@ -466,9 +579,6 @@ async fn handle_epoch_report(
 
             if format_ok {
                 // 5. [核心] 调用 RSUC::batch_verify_update
-                // 参数1: sender_current_c (Operator 记录的最新状态, 可能已扣除发送)
-                // 参数2: epoch_base_c (用户汇报的本轮基准状态)
-                // 参数3: updates (接收列表)
                 let result_ac = RSUC::batch_verify_update(
                     sender_current_c, 
                     epoch_base_c, 
