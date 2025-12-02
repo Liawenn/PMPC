@@ -60,7 +60,9 @@ pub async fn run(
         println!("    Hex ID: {}", channel_id_bytes);
 
         println!("[3] 正在链上注册通道...");
+        let t = std::time::Instant::now();
         let _ = blockchain::create_channel(&op_config, &rpc_url, conf.payment_channel, channel_id_bytes).await;
+        println!("{:?}", t.elapsed());
     }
 
     // 2. RSUC 初始化
