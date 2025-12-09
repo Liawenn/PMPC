@@ -88,7 +88,7 @@ pub async fn create_channel(
     ).await?;
     
     println!("✅ 通道注册成功! Tx: {}", tx_hash);
-    println!("⏱️ 耗时: {:?}", t.elapsed());
+    println!("⏱️ create耗时: {:?}", t.elapsed());
 
     Ok((channel_id_str, channel_id_bytes))
 }
@@ -709,6 +709,7 @@ async fn handle_exit(
                     } else {
                         println!("🔒 [Auto-Close] 倒计时结束，通道仍为空。正在执行链上关闭...");
                         
+                        let t = std::time::Instant::now();
                         match blockchain::close_channel(
                             &op_config_clone, 
                             &rpc_url_clone, 
@@ -724,6 +725,7 @@ async fn handle_exit(
                                 println!("❌ [Auto-Close] 关闭失败: {}", e);
                             }
                         }
+                        println!("⏱️ close耗时: {:?}", t.elapsed());
                     }
                 });
             }
